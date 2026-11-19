@@ -4,8 +4,13 @@ import re
 
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
+    DeviceSelector,
+    DeviceSelectorConfig,
+    SelectSelector,
+    SelectSelectorConfig,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -15,12 +20,16 @@ from .const import (
     DOMAIN,
     CONF_ADDRESS,
     CONF_DEVICE_TYPE,
+    CONF_GARMIN_ACCOUNT,
+    CONF_NOTIFICATION_DEVICE,
     DEVICE_TYPES,
 )
+from .garmin_upload import list_garmin_accounts
 from .schema_compat import vol
 
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+_NO_ACCOUNT = "none"
 
 
 def _looks_like_pm5(info: BluetoothServiceInfoBleak) -> bool:
@@ -34,6 +43,13 @@ def _normalize_mac(mac: str) -> str:
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> WorkoutOptionsFlow:
+        return WorkoutOptionsFlow()
 
     def __init__(self) -> None:
         self._discovered_address: str | None = None
@@ -113,3 +129,39 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+
+class WorkoutOptionsFlow(config_entries.OptionsFlow):
+    """Configure workout review without restarting the monitor connection."""
+
+    async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
+        if user_input is not None:
+            options = dict(user_input)
+            if options.get(CONF_GARMIN_ACCOUNT) == _NO_ACCOUNT:
+                options.pop(CONF_GARMIN_ACCOUNT)
+            return self.async_create_entry(data=options)
+
+        accounts = list_garmin_accounts(self.hass)
+        choices = [{"value": _NO_ACCOUNT, "label": "No default account"}]
+        choices.extend(
+            {"value": account["entry_id"], "label": account["name"]}
+            for account in accounts
+        )
+        options = dict(self.config_entry.options)
+        selected = options.get(CONF_GARMIN_ACCOUNT)
+        if selected and not any(choice["value"] == selected for choice in choices):
+            choices.append({"value": selected, "label": "Saved account (unavailable)"})
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_GARMIN_ACCOUNT, default=_NO_ACCOUNT): SelectSelector(
+                    SelectSelectorConfig(options=choices)
+                ),
+                vol.Optional(CONF_NOTIFICATION_DEVICE): DeviceSelector(
+                    DeviceSelectorConfig(filter={"integration": "mobile_app"})
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(schema, options),
+        )

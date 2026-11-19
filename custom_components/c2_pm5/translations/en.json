@@ -17,5 +17,20 @@
             }
         }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Workout review",
+        "data": {
+          "garmin_account": "Default Garmin Connect account",
+          "notification_device": "Phone for workout review"
+        },
+        "data_description": {
+          "garmin_account": "Choose the account to preselect for this monitor's workouts.",
+          "notification_device": "Choose a Home Assistant Companion App device to receive upload approval prompts. Clear this field to turn off phone prompts."
+        }
+      }
+    }
   }
 }

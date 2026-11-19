@@ -23,13 +23,16 @@ from .pm5_ble import PM5BleSession, PM5Data
 from .schema_compat import vol
 from .status_panel import async_setup_panel
 from .workout_manager import WorkoutError, WorkoutManager
+from .workout_notifications import WorkoutNotifications
 from .workout_recorder import WorkoutRecorder
 
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_CONNECT_HRM = "connect_hrm"
 SERVICE_UPLOAD_WORKOUT = "upload_workout"
+SERVICE_KEEP_WORKOUT = "keep_workout"
 DATA_WORKOUT_MANAGER = "workout_manager"
+DATA_WORKOUT_NOTIFICATIONS = "workout_notifications"
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 SERVICE_SCHEMA_CONNECT_HRM = vol.Schema(
@@ -115,6 +118,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     manager = WorkoutManager(hass)
     await manager.async_initialize()
     domain_data[DATA_WORKOUT_MANAGER] = manager
+    notifications = WorkoutNotifications(hass, manager)
+    domain_data[DATA_WORKOUT_NOTIFICATIONS] = notifications
 
     def coordinators() -> list[PM5Coordinator]:
         return [
@@ -140,10 +145,16 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         try:
             await manager.async_upload(
                 call.data["workout_id"],
-                call.data["garmin_entity_id"],
+                call.data.get("garmin_entity_id"),
                 call.data["retry"],
                 call.data.get("upload_attempt"),
             )
+        except WorkoutError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def _handle_keep_workout(call: ServiceCall) -> None:
+        try:
+            await manager.async_keep_workout(call.data["workout_id"])
         except WorkoutError as err:
             raise HomeAssistantError(str(err)) from err
 
@@ -167,13 +178,21 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         schema=vol.Schema(
             {
                 vol.Required("workout_id"): cv.string,
-                vol.Required("garmin_entity_id"): cv.entity_id,
+                vol.Optional("garmin_entity_id"): cv.entity_id,
                 vol.Optional("retry", default=False): cv.boolean,
                 vol.Optional("upload_attempt"): cv.positive_int,
             }
         ),
     )
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_KEEP_WORKOUT,
+        _handle_keep_workout,
+        schema=vol.Schema({vol.Required("workout_id"): cv.string}),
+    )
     await async_setup_panel(hass, get_devices, manager)
+    notifications.async_listen()
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _finish_recordings)
     return True
 
@@ -194,6 +213,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator.recorder.close()
         await coordinator.session.stop()
         raise
+    notifications: WorkoutNotifications = domain_data[DATA_WORKOUT_NOTIFICATIONS]
+    entry.async_on_unload(
+        entry.add_update_listener(notifications.async_options_updated)
+    )
     return True
 
 

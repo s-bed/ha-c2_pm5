@@ -81,6 +81,7 @@ jobs:
 
           asyncio.run(check())
           PY
+          python -m unittest discover -s "$GITHUB_WORKSPACE/tests"
 
   validate-hassfest:
     runs-on: "ubuntu-latest"

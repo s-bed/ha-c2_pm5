@@ -8,6 +8,7 @@ from homeassistant.helpers import entity_registry as er
 
 GARMIN_DOMAIN = "garmin_connect"
 GARMIN_UPLOAD_SERVICE = "upload_activity"
+GARMIN_UPLOAD_ACTION = (GARMIN_DOMAIN, GARMIN_UPLOAD_SERVICE)
 
 
 def _account_entry(hass: HomeAssistant, entity: er.RegistryEntry) -> ConfigEntry | None:
@@ -54,6 +55,7 @@ def list_garmin_accounts(hass: HomeAssistant) -> list[dict]:
         _, entity_id = min(sensors)
         result.append(
             {
+                "entry_id": entry.entry_id,
                 "entity_id": entity_id,
                 "entity_ids": sorted(entity_id for _, entity_id in sensors),
                 "name": entry.title or entity_id,
@@ -62,6 +64,21 @@ def list_garmin_accounts(hass: HomeAssistant) -> list[dict]:
         )
     return sorted(
         result, key=lambda account: (account["name"].casefold(), account["entity_id"])
+    )
+
+
+@callback
+def garmin_account(hass: HomeAssistant, entry_id: str | None) -> dict | None:
+    """Resolve the current upload sensor for a saved account preference."""
+    if entry_id is None:
+        return None
+    return next(
+        (
+            account
+            for account in list_garmin_accounts(hass)
+            if account["entry_id"] == entry_id
+        ),
+        None,
     )
 
 

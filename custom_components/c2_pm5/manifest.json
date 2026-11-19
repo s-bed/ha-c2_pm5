@@ -1,6 +1,7 @@
 {
   "domain": "c2_pm5",
   "name": "Concept2 PM5",
+  "after_dependencies": ["mobile_app"],
   "bluetooth": [
     {
       "local_name": "PM5*"
