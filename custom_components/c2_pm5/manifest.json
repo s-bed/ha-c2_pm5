@@ -10,12 +10,12 @@
       "service_uuid": "ce060000-43e5-11e4-916c-0800200c9a66"
     }
   ],
-  "codeowners": ["@doug-hoffman"],
+  "codeowners": ["@s-bed"],
   "config_flow": true,
   "dependencies": ["bluetooth", "bluetooth_adapters", "frontend", "http", "panel_custom", "websocket_api"],
   "documentation": "https://github.com/s-bed/ha-c2_pm5",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/doug-hoffman/ha-c2_pm5/issues",
+  "issue_tracker": "https://github.com/s-bed/ha-c2_pm5/issues",
   "requirements": ["garmin-fit-sdk==21.221.0"],
   "version": "2026.11.0"
 }
