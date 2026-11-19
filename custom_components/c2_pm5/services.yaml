@@ -46,8 +46,7 @@ upload_workout:
         text:
     garmin_entity_id:
       name: Garmin account
-      description: A Garmin Connect sensor belonging to the destination account.
-      required: true
+      description: A Garmin Connect sensor for the destination account. Leave blank to use the monitor default, or the original account when retrying.
       selector:
         entity:
           domain: sensor
@@ -65,3 +64,14 @@ upload_workout:
         number:
           min: 1
           mode: box
+
+keep_workout:
+  name: Keep workout locally
+  description: Decline Garmin upload and retain the workout and its FIT download in Home Assistant.
+  fields:
+    workout_id:
+      name: Workout ID
+      description: Identifier of a workout saved on the Concept2 PM5 status page.
+      required: true
+      selector:
+        text:

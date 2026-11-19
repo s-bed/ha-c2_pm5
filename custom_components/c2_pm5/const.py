@@ -8,6 +8,8 @@ PLATFORMS = ["sensor"]
 
 CONF_ADDRESS = "address"
 CONF_DEVICE_TYPE = "device_type"
+CONF_GARMIN_ACCOUNT = "garmin_account"
+CONF_NOTIFICATION_DEVICE = "notification_device"
 
 # User-selectable device types
 DEVICE_TYPE_ROWERG = "RowErg"
@@ -15,6 +17,7 @@ DEVICE_TYPES = [DEVICE_TYPE_ROWERG]
 
 # Events
 EVENT_PM5_AVAILABILITY_CHANGED = f"{DOMAIN}_availability_changed"
+SIGNAL_WORKOUT_UPDATED = f"{DOMAIN}_workout_updated"
 
 # ======================
 # PM5 BLE + CSAFE control

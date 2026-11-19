@@ -70,9 +70,17 @@ If the device is not discovered automatically:
 1. Open **Concept2 PM5** in Home Assistant's sidebar as an administrator. Wake the PM5, open **Connect**, and wait for the page to show **Connected** before rowing.
 2. To include heart rate, pair a compatible Bluetooth Smart or ANT+ sensor through **Connect → Connect Heart Rate** on the PM5. Check that the live page shows a BPM reading. [Concept2 pairing instructions](https://www.concept2.com/support/heart-rate-equipment/garmin-suunto/how-to-use)
 3. Row the workout, then press **Menu** on the PM5 to end it. Home Assistant saves it automatically. The page labels captures with missing portions as **Partial recording**.
-4. Select the workout and choose **Download FIT** or select an account and choose **Upload to Garmin**. Upload uses the same `garmin_connect.upload_activity` action as King Smith and reuses your existing Garmin Connect account. [Garmin Connect upload action](https://github.com/cyberjunky/home-assistant-garmin_connect#garmin_connectupload_activity)
+4. Select the workout and choose **Download FIT**, **Upload to Garmin**, or **Keep locally**. Upload uses the same `garmin_connect.upload_activity` action as King Smith and reuses your existing Garmin Connect account. [Garmin Connect upload action](https://github.com/cyberjunky/home-assistant-garmin_connect#garmin_connectupload_activity)
 
-The FIT activity includes rowing time, distance, pace, stroke rate, power, calories, and heart-rate samples when the PM5 reports them. It stores one lap for the full workout. Heart-rate gaps remain empty. Recordings are saved in Home Assistant and survive restarts. If the result of an upload is uncertain, check Garmin Connect before retrying from the page.
+The FIT activity includes rowing time, distance, pace, stroke rate, power, calories, and heart-rate samples when the PM5 reports them. It stores one lap for the full workout. Heart-rate gaps remain empty. Recordings are saved in Home Assistant and survive restarts.
+
+### Default Garmin account and phone approval
+
+1. Open **Settings → Devices & services → Concept2 PM5 → Configure** for your monitor.
+2. Choose a **Default Garmin Connect account** and a **Phone for workout review**, then save. Use a device registered with the Home Assistant Companion App. You can set a default without enabling phone notifications.
+3. When a row is saved, the phone shows the duration and distance. Choose **Upload to Garmin** to send it to the configured account or **Keep locally** to skip the upload and retain the FIT download. The sidebar preselects the default account and lets you choose another for an individual row.
+
+Pending rows are eligible for notification when you enable phone review and after a Home Assistant restart. If an upload result is uncertain, open the workout in Home Assistant and check Garmin before explicitly retrying.
 
 ---
 
@@ -122,9 +130,9 @@ If a workout is left running and the machine becomes idle:
 
 ## Publishing a release
 
-Set the new version in `custom_components/c2_pm5/manifest.json` and add a matching `## x.y.z` section to [CHANGELOG.md](CHANGELOG.md). After merging those changes, create and push a tag that matches the version exactly, such as `2026.11.0`. The Release workflow builds `c2_pm5.zip` and publishes it with that version's changelog as the GitHub release body. Marketplace uses that body in **Settings → Updates**.
+Set the new version in `custom_components/c2_pm5/manifest.json` and add a matching `## x.y.z` section to [CHANGELOG.md](CHANGELOG.md). When those changes reach `main`, the Release workflow automatically tags the commit with the manifest version and publishes `c2_pm5.zip` with the matching changelog. Marketplace shows those release notes under **Settings → Updates**.
 
-For development builds, tag the commit you want to test with the manifest version followed by `-dev.N`, for example `2026.11.0-dev.1`, and push the tag from your working branch. The workflow publishes it as a GitHub prerelease and sets the version inside the ZIP to the tag. Add a matching `## x.y.z-dev.N` changelog section for preview-specific notes. If that section is absent, the workflow uses the target release notes.
+Pushes to `dev` and branches under `codex/` automatically publish prereleases with the next `-dev.N` suffix for the manifest version. The workflow sets the version inside the ZIP to that tag. Add a matching `## x.y.z-dev.N` changelog section for preview-specific notes. Otherwise, the workflow uses the stable version's notes. Pushing a version tag manually also triggers the Release workflow.
 
 ---
 

@@ -4,8 +4,8 @@ from base64 import b64encode
 from pathlib import Path
 from uuid import UUID
 
-from .const import DOMAIN
-from .garmin_upload import list_garmin_accounts
+from .const import CONF_GARMIN_ACCOUNT, DOMAIN
+from .garmin_upload import GARMIN_UPLOAD_ACTION, list_garmin_accounts
 from .schema_compat import vol
 from .workout_manager import WorkoutError
 
@@ -42,14 +42,18 @@ async def async_setup_panel(hass, get_devices, manager) -> None:
     @websocket_api.require_admin
     @websocket_api.async_response
     async def list_workouts(hass, connection, message):
+        workouts = manager.list_workouts()
+        for workout in workouts:
+            options = manager.workout_options(workout["address"])
+            workout["default_garmin_account"] = options.get(CONF_GARMIN_ACCOUNT)
         connection.send_result(
             message["id"],
             {
-                "workouts": manager.list_workouts(),
+                "workouts": workouts,
                 "storage_error": manager.last_error,
                 "garmin_accounts": list_garmin_accounts(hass),
                 "garmin_upload_available": hass.services.has_service(
-                    "garmin_connect", "upload_activity"
+                    *GARMIN_UPLOAD_ACTION
                 ),
             },
         )

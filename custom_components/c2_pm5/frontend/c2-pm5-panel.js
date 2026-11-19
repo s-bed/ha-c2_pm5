@@ -6,6 +6,7 @@ const WORKOUT_STATUS = {
   ready: "Ready to upload",
   uploading: "Uploading",
   uploaded: "Uploaded",
+  kept_local: "Kept locally",
   needs_review: "Check Garmin",
 };
 
@@ -156,6 +157,8 @@ class Concept2Panel extends HTMLElement {
     this._devices = [];
     this._workouts = [];
     this._accounts = [];
+    this._accountSelections = new Map();
+    this._workoutId = new URLSearchParams(window.location.search).get("workout");
     this._lastHistoryRefresh = 0;
     this._ref("menu").addEventListener("click", () => {
       this.dispatchEvent(new CustomEvent("hass-toggle-menu", { bubbles: true, composed: true }));
@@ -380,6 +383,9 @@ class Concept2Panel extends HTMLElement {
     actions.append(download);
     if (workout.status === "ready" || workout.status === "needs_review") {
       this._addUploadControls(panel, actions, workout);
+      const keep = button("Keep locally", () => this._review(workout, "keep_workout", {}));
+      keep.disabled = Boolean(this._busy);
+      actions.append(keep);
     }
     panel.append(actions);
   }
@@ -399,9 +405,11 @@ class Concept2Panel extends HTMLElement {
     }
     const available = this._garminUploadAvailable && this._accounts.some((account) => account.available);
     select.disabled = !available || Boolean(this._busy);
-    if (this._accounts.some((account) => account.entity_id === this._account && account.available)) {
-      select.value = this._account;
-    }
+    const preferred = this._accounts.find((account) => retrying
+      ? account.entity_ids.includes(workout.garmin_entity_id)
+      : account.entry_id === workout.default_garmin_account);
+    const selected = this._accountSelections.get(workout.workout_id) ?? preferred?.entity_id;
+    select.value = this._accounts.some((account) => account.entity_id === selected) ? selected : "";
     field.append(label, select);
     const upload = button(
       retrying ? "Retry upload" : "Upload to Garmin",
@@ -414,10 +422,11 @@ class Concept2Panel extends HTMLElement {
     retry.checked = this._confirmedRetry === retryKey;
     retry.disabled = Boolean(this._busy);
     const updateControls = () => {
-      upload.disabled = !available || Boolean(this._busy) || !select.value || (retrying && !retry.checked);
+      const selectedAvailable = this._accounts.some((account) => account.entity_id === select.value && account.available);
+      upload.disabled = !available || Boolean(this._busy) || !selectedAvailable || (retrying && !retry.checked);
     };
     select.addEventListener("change", () => {
-      this._account = select.value;
+      this._accountSelections.set(workout.workout_id, select.value);
       updateControls();
     });
     retry.addEventListener("change", () => {
@@ -430,6 +439,8 @@ class Concept2Panel extends HTMLElement {
         ? "No Garmin Connect account is available for uploads."
         : "The Garmin Connect upload action is unavailable.";
       panel.append(element("p", reason, "notice muted"));
+    } else if (preferred && !preferred.available) {
+      panel.append(element("p", "The preselected Garmin account is unavailable. Select another account to upload now.", "notice muted"));
     }
     if (retrying) {
       const confirmation = element("label", undefined, "line notice");
@@ -442,18 +453,24 @@ class Concept2Panel extends HTMLElement {
   async _upload(workout, account) {
     if (this._busy || !account) return;
     const id = workout.workout_id;
-    const data = { workout_id: id, garmin_entity_id: account };
+    const data = { garmin_entity_id: account };
     if (workout.status === "needs_review") {
       if (this._confirmedRetry !== id + ":" + workout.upload_attempt) return;
       data.retry = true;
       data.upload_attempt = workout.upload_attempt;
       this._confirmedRetry = null;
     }
+    await this._review(workout, "upload_workout", data);
+  }
+
+  async _review(workout, service, data) {
+    if (this._busy) return;
+    const id = workout.workout_id;
     this._busy = true;
-    this._actionNotice = { id, text: "Sending workout to Garmin…" };
+    this._actionNotice = { id, text: service === "upload_workout" ? "Sending workout to Garmin…" : "Saving review decision…" };
     this._renderWorkout();
     try {
-      await this._hass.callService(DOMAIN, "upload_workout", data);
+      await this._hass.callService(DOMAIN, service, { ...data, workout_id: id });
       this._actionNotice = null;
     } catch (error) {
       this._actionNotice = { id, text: errorMessage(error), error: true };

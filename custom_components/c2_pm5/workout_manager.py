@@ -6,19 +6,27 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from uuid import UUID
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DOMAIN
+from .const import CONF_ADDRESS, CONF_GARMIN_ACCOUNT, DOMAIN, SIGNAL_WORKOUT_UPDATED
 from .fit_export import encode_workout
-from .garmin_upload import async_upload_workout, garmin_account_ready
+from .garmin_upload import (
+    GARMIN_UPLOAD_ACTION,
+    async_upload_workout,
+    garmin_account,
+    garmin_account_ready,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _UNCERTAIN = "The upload outcome is uncertain. Check Garmin before retrying."
-_UPLOAD_ACTION = ("garmin_connect", "upload_activity")
+REVIEW_STATUSES = frozenset({"ready", "needs_review"})
+_RESOLVED_STATUSES = ("uploaded", "kept_local")
 
 
 class WorkoutError(Exception):
@@ -86,7 +94,10 @@ class WorkoutManager:
                         "Could not read upload status for PM5 workout %s", workout_id
                     )
                 else:
-                    if isinstance(upload, dict) and upload.get("status") == "uploaded":
+                    if (
+                        isinstance(upload, dict)
+                        and upload.get("status") in _RESOLVED_STATUSES
+                    ):
                         summary.update(upload)
                     else:
                         if isinstance(upload, dict):
@@ -107,6 +118,17 @@ class WorkoutManager:
             return self._workouts[workout_id]
         except KeyError as err:
             raise WorkoutError("Workout not found.") from err
+
+    def get_summary(self, workout_id: str) -> dict:
+        """Return the current saved review state for one workout."""
+        return dict(self._get_summary(workout_id))
+
+    def workout_options(self, address: str) -> Mapping:
+        """Read current review settings for the monitor that recorded a workout."""
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if entry.disabled_by is None and entry.data[CONF_ADDRESS] == address:
+                return entry.options
+        return {}
 
     def list_workouts(self) -> list[dict]:
         """Return compact history for the status panel."""
@@ -147,6 +169,7 @@ class WorkoutManager:
                     self._workouts[workout_id] = dict(
                         summary, status="ready", error=None, upload_attempt=0
                     )
+                    async_dispatcher_send(self.hass, SIGNAL_WORKOUT_UPDATED, workout_id)
                 del self._unsaved[workout_id]
             if self._unsaved:
                 self.last_error = "A completed workout could not be saved."
@@ -171,7 +194,7 @@ class WorkoutManager:
             return json.load(recording)
 
     async def async_get_workout(self, workout_id: str) -> dict:
-        summary = dict(self._get_summary(workout_id))
+        summary = self.get_summary(workout_id)
         try:
             samples = await self.hass.async_add_executor_job(
                 self._read_samples, workout_id
@@ -200,7 +223,7 @@ class WorkoutManager:
     async def async_upload(
         self,
         workout_id: str,
-        entity_id: str,
+        entity_id: str | None = None,
         retry: bool = False,
         upload_attempt: int | None = None,
     ) -> dict:
@@ -209,12 +232,28 @@ class WorkoutManager:
             summary = self._get_summary(workout_id)
             if summary["status"] in ("uploading", "uploaded"):
                 return dict(summary)
+            if summary["status"] == "kept_local":
+                raise WorkoutError("This workout was marked to be kept locally.")
             if summary["status"] == "needs_review" and (
                 not retry or upload_attempt != summary["upload_attempt"]
             ):
                 raise WorkoutError(_UNCERTAIN)
-            if not self.hass.services.has_service(*_UPLOAD_ACTION):
+            if not self.hass.services.has_service(*GARMIN_UPLOAD_ACTION):
                 raise WorkoutError("The Garmin Connect upload action is unavailable.")
+            if entity_id is None:
+                if summary["status"] == "needs_review":
+                    # A retry without an override stays on the original destination.
+                    entity_id = summary.get("garmin_entity_id")
+                else:
+                    options = self.workout_options(summary["address"])
+                    account = garmin_account(
+                        self.hass, options.get(CONF_GARMIN_ACCOUNT)
+                    )
+                    entity_id = account["entity_id"] if account else None
+            if entity_id is None:
+                raise WorkoutError(
+                    "Select a Garmin Connect account or configure a default."
+                )
             if not garmin_account_ready(self.hass, entity_id):
                 raise WorkoutError("Select an available Garmin Connect account.")
 
@@ -253,6 +292,29 @@ class WorkoutManager:
         await self._finish_upload(workout_id, dict(attempt, status="uploaded"))
         return dict(self._get_summary(workout_id))
 
+    async def async_keep_workout(self, workout_id: str) -> None:
+        """Decline a Garmin upload and retain the recording and its FIT export."""
+        async with self._lock:
+            summary = self._get_summary(workout_id)
+            if summary["status"] == "kept_local":
+                return
+            if summary["status"] not in REVIEW_STATUSES:
+                raise WorkoutError(
+                    "A workout already uploading or sent cannot be skipped."
+                )
+            state = {
+                "status": "kept_local",
+                "error": None,
+                "upload_attempt": summary["upload_attempt"],
+            }
+            if "garmin_entity_id" in summary:
+                state["garmin_entity_id"] = summary["garmin_entity_id"]
+            try:
+                await self._save_upload_state(workout_id, state)
+            except OSError as err:
+                raise WorkoutError("The review decision could not be saved.") from err
+            async_dispatcher_send(self.hass, SIGNAL_WORKOUT_UPDATED, workout_id)
+
     async def _finish_upload(self, workout_id: str, state: dict) -> None:
         async with self._lock:
             try:
@@ -265,3 +327,5 @@ class WorkoutManager:
                     status="needs_review", error=_UNCERTAIN
                 )
                 raise WorkoutError(_UNCERTAIN) from err
+            finally:
+                async_dispatcher_send(self.hass, SIGNAL_WORKOUT_UPDATED, workout_id)
