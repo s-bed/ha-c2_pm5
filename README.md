@@ -130,9 +130,9 @@ If a workout is left running and the machine becomes idle:
 
 ## Publishing a release
 
-Set the new version in `custom_components/c2_pm5/manifest.json` and add a matching `## x.y.z` section to [CHANGELOG.md](CHANGELOG.md). After merging those changes, create and push a tag that matches the version exactly, such as `2026.11.0`. The Release workflow builds `c2_pm5.zip` and publishes it with that version's changelog as the GitHub release body. Marketplace uses that body in **Settings → Updates**.
+Set the new version in `custom_components/c2_pm5/manifest.json` and add a matching `## x.y.z` section to [CHANGELOG.md](CHANGELOG.md). When those changes reach `main`, the Release workflow automatically tags the commit with the manifest version and publishes `c2_pm5.zip` with the matching changelog. Marketplace shows those release notes under **Settings → Updates**.
 
-For development builds, tag the commit you want to test with the manifest version followed by `-dev.N`, for example `2026.11.0-dev.1`, and push the tag from your working branch. The workflow publishes it as a GitHub prerelease and sets the version inside the ZIP to the tag. Add a matching `## x.y.z-dev.N` changelog section for preview-specific notes. If that section is absent, the workflow uses the target release notes.
+Pushes to `dev` and branches under `codex/` automatically publish prereleases with the next `-dev.N` suffix for the manifest version. The workflow sets the version inside the ZIP to that tag. Add a matching `## x.y.z-dev.N` changelog section for preview-specific notes. Otherwise, the workflow uses the stable version's notes. Pushing a version tag manually also triggers the Release workflow.
 
 ---
 

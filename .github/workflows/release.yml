@@ -2,37 +2,86 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
+      - dev
+      - "codex/**"
     tags:
       - "[0-9]*.[0-9]*.[0-9]*"
 
 permissions: {}
 
+concurrency:
+  group: pm5-marketplace-release
+  queue: max
+
 jobs:
   release:
+    if: github.event.deleted == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Check out the tagged source
+      - name: Check out the pushed commit and release tags
         uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Build the Marketplace ZIP and release notes
-        run: python .github/scripts/build_release.py "$RUNNER_TEMP" --tag "$GITHUB_REF_NAME"
+      - name: Select the release tag
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag=$(python .github/scripts/select_release_tag.py "$GITHUB_REF_NAME")
+          fi
+          if [[ -z "$tag" ]]; then
+            echo "The manifest version already has a release tag. Update the version and changelog for the next stable release."
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Publish the release with its ZIP and notes
+      - name: Build the Marketplace ZIP and release notes
+        if: steps.version.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: python .github/scripts/build_release.py "$RUNNER_TEMP" --tag "$RELEASE_TAG"
+
+      - name: Create the tag and publish the release
+        if: steps.version.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
+          commit=$(git rev-parse HEAD)
+          if tagged_commit=$(git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG^{commit}"); then
+            if [[ "$tagged_commit" != "$commit" ]]; then
+              echo "Tag $RELEASE_TAG points to a different commit." >&2
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF_TYPE" == branch ]]; then
+            gh api --method POST "repos/$GH_REPO/git/refs" --silent \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$commit"
+          fi
+
           release_flags=()
-          if [[ "$GITHUB_REF_NAME" == *-dev.* ]]; then
+          if [[ "$RELEASE_TAG" == *-dev.* ]]; then
             release_flags+=(--prerelease --latest=false)
           fi
-          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/c2_pm5.zip" \
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [[ "$draft" == true ]]; then
+              gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/c2_pm5.zip" --clobber
+              gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}"
+            else
+              echo "Release $RELEASE_TAG is already published."
+            fi
+            exit 0
+          fi
+
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/c2_pm5.zip" \
             --verify-tag \
-            --title "Concept2 PM5 $GITHUB_REF_NAME" \
+            --title "Concept2 PM5 $RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             "${release_flags[@]}"
