@@ -1,6 +1,6 @@
 # Concept2 PM5 – Home Assistant Integration
 
-This integration connects **Concept2 PM5 monitors** (RowErg) to **Home Assistant** over Bluetooth using the official Concept2 protocol.
+This integration connects **Concept2 PM5 monitors** (RowErg) to **Home Assistant** over Bluetooth using the official Concept2 protocol. See the [s-bed fork](https://github.com/s-bed/ha-c2_pm5) for the source and [published releases](https://github.com/s-bed/ha-c2_pm5/releases).
 
 ---
 
