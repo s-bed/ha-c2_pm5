@@ -23,8 +23,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
-      - name: Build the package and release notes
-        run: python .github/scripts/build_release.py "$RUNNER_TEMP"
+      - name: Build the stable and prerelease packages
+        run: |
+          python .github/scripts/build_release.py "$RUNNER_TEMP"
+          version=$(python -c 'import json; from pathlib import Path; print(json.loads(Path("custom_components/c2_pm5/manifest.json").read_text())["version"])')
+          python .github/scripts/build_release.py "$RUNNER_TEMP/prerelease" --tag "$version-dev.1"
       - name: Install Home Assistant and integration dependencies
         run: >-
           python -m pip install
@@ -41,22 +44,29 @@ jobs:
           dbus-fast==5.0.22
           habluetooth==7.1.2
           serialx==1.15.1
-      - name: Set up the packaged integration
+      - name: Set up the packaged prerelease
         run: |
           package_root="$RUNNER_TEMP/pm5-smoke"
-          python -m zipfile -e "$RUNNER_TEMP/c2_pm5.zip" "$package_root/custom_components/c2_pm5"
+          python -m zipfile -e "$RUNNER_TEMP/prerelease/c2_pm5.zip" "$package_root/custom_components/c2_pm5"
           cd "$package_root"
           python - <<'PY'
           import asyncio
+          import json
           from pathlib import Path
           from tempfile import TemporaryDirectory
           from types import SimpleNamespace
           from unittest.mock import AsyncMock
 
+          from awesomeversion import AwesomeVersion
           from homeassistant.components import frontend
           from homeassistant.core import HomeAssistant
 
           from custom_components.c2_pm5 import async_setup, config_flow, sensor
+
+          manifest = Path("custom_components/c2_pm5/manifest.json")
+          version = json.loads(manifest.read_text())["version"]
+          base_version, suffix = version.split("-dev.")
+          assert suffix == "1" and AwesomeVersion(version) < AwesomeVersion(base_version)
 
           async def check():
               with TemporaryDirectory() as config_dir:

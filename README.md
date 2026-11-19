@@ -43,6 +43,8 @@ Before Home Assistant can detect the PM5:
 
 On Home Assistant 2026.11 or later, open **Settings → Marketplace**, connect GitHub if prompted, and add `https://github.com/s-bed/ha-c2_pm5` as an integration using **Add from link**. Install the published release, then add **Concept2 PM5** under **Settings → Devices & services**. Updates and the release changelog appear under **Settings → Updates**.
 
+To install a development build, open the repository in Marketplace and choose **⋮ → Include pre-releases**. Choose **Install** when the desired `-dev.N` version is displayed, or use **⋮ → Install another version** to select a specific prerelease.
+
 ### Automatic Discovery (Recommended)
 
 1. Enable the PM5 **app connection** (see above)
@@ -121,6 +123,8 @@ If a workout is left running and the machine becomes idle:
 ## Publishing a release
 
 Set the new version in `custom_components/c2_pm5/manifest.json` and add a matching `## x.y.z` section to [CHANGELOG.md](CHANGELOG.md). After merging those changes, create and push a tag that matches the version exactly, such as `2026.11.0`. The Release workflow builds `c2_pm5.zip` and publishes it with that version's changelog as the GitHub release body. Marketplace uses that body in **Settings → Updates**.
+
+For development builds, tag the commit you want to test with the manifest version followed by `-dev.N`, for example `2026.11.0-dev.1`, and push the tag from your working branch. The workflow publishes it as a GitHub prerelease and sets the version inside the ZIP to the tag. Add a matching `## x.y.z-dev.N` changelog section for preview-specific notes. If that section is absent, the workflow uses the target release notes.
 
 ---
 
