@@ -30,6 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 SERVICE_CONNECT_HRM = "connect_hrm"
 SERVICE_UPLOAD_WORKOUT = "upload_workout"
 DATA_WORKOUT_MANAGER = "workout_manager"
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 SERVICE_SCHEMA_CONNECT_HRM = vol.Schema(
     {
