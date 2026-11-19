@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
@@ -18,6 +17,7 @@ from .const import (
     CONF_DEVICE_TYPE,
     DEVICE_TYPES,
 )
+from .schema_compat import vol
 
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")

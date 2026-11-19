@@ -1,3 +1,6 @@
 {
-  "name": "Concept2 PM5"
+  "name": "Concept2 PM5",
+  "filename": "c2_pm5.zip",
+  "hide_default_branch": true,
+  "zip_release": true
 }

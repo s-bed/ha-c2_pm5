@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build the Marketplace ZIP and release notes
+        run: python .github/scripts/build_release.py "$RUNNER_TEMP" --tag "$GITHUB_REF_NAME"
+
+      - name: Publish the release with its ZIP and notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_flags=()
+          if [[ "$GITHUB_REF_NAME" == *-dev.* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/c2_pm5.zip" \
+            --verify-tag \
+            --title "Concept2 PM5 $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "${release_flags[@]}"

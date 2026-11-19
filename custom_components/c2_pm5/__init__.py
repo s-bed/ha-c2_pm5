@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from time import time
 
-import voluptuous as vol
-
-from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -17,10 +20,17 @@ from .const import (
     PLATFORMS,
 )
 from .pm5_ble import PM5BleSession, PM5Data
+from .schema_compat import vol
+from .status_panel import async_setup_panel
+from .workout_manager import WorkoutError, WorkoutManager
+from .workout_recorder import WorkoutRecorder
 
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_CONNECT_HRM = "connect_hrm"
+SERVICE_UPLOAD_WORKOUT = "upload_workout"
+DATA_WORKOUT_MANAGER = "workout_manager"
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 SERVICE_SCHEMA_CONNECT_HRM = vol.Schema(
     {
@@ -39,11 +49,22 @@ class PM5State:
 
 
 class PM5Coordinator(DataUpdateCoordinator[PM5State]):
-    def __init__(self, hass: HomeAssistant, address: str, device_type: str):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_name: str,
+        address: str,
+        device_type: str,
+        workout_manager: WorkoutManager,
+    ) -> None:
         super().__init__(hass, _LOGGER, name=device_type, update_interval=None)
         self.address = address
         self.device_type = device_type
+        self.entry_name = entry_name
         self.state = PM5State()
+        self.recorder = WorkoutRecorder(
+            hass.loop, address, entry_name, workout_manager.record
+        )
         self.async_set_updated_data(self.state)
 
         self.session = PM5BleSession(
@@ -51,6 +72,7 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
         )
 
     def _handle_available(self, available: bool) -> None:
+        self.recorder.set_connected(available)
         if available and available is not self.state.available:
             # Clear values so we don't expose stale state
             self.state.values = {}
@@ -73,35 +95,62 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
 
     def _handle_data(self, data: PM5Data) -> None:
         self.state.values.update(data.values)
+        self.recorder.receive(data.values, time())
         self.async_set_updated_data(self.state)
 
+    def status(self) -> dict:
+        return {
+            "address": self.address,
+            "name": self.entry_name,
+            "connected": self.session.is_connected,
+            "available": self.session.is_discoverable,
+            "recording": self.recorder.recording,
+            "values": dict(self.state.values) if self.state.available else {},
+        }
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the panel and workout actions once for all PM5 monitors."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    manager = WorkoutManager(hass)
+    await manager.async_initialize()
+    domain_data[DATA_WORKOUT_MANAGER] = manager
+
+    def coordinators() -> list[PM5Coordinator]:
+        return [
+            value for value in domain_data.values() if isinstance(value, PM5Coordinator)
+        ]
+
+    def get_devices() -> list[dict]:
+        return [coordinator.status() for coordinator in coordinators()]
+
     async def _handle_connect_hrm(call: ServiceCall) -> None:
         address = call.data["address"].strip().upper()
-
-        # Locate the matching coordinator by MAC
-        for _entry_id, coordinator in hass.data[DOMAIN].items():
-            if getattr(coordinator, "address", "").upper() == address:
-                session = getattr(coordinator, "session", None)
-                if session is None:
-                    raise ValueError("Coordinator has no session")
-                await session.async_set_hrbelt_info(
+        for coordinator in coordinators():
+            if coordinator.address.upper() == address:
+                await coordinator.session.async_set_hrbelt_info(
                     call.data["manufacturer_id"],
                     call.data["device_type"],
                     call.data["belt_id"],
                 )
                 return
+        raise HomeAssistantError(f"No configured PM5 matches address {address}")
 
-        raise ValueError(f"No configured PM5 matches address {address}")
+    async def _handle_upload_workout(call: ServiceCall) -> None:
+        try:
+            await manager.async_upload(
+                call.data["workout_id"],
+                call.data["garmin_entity_id"],
+                call.data["retry"],
+                call.data.get("upload_attempt"),
+            )
+        except WorkoutError as err:
+            raise HomeAssistantError(str(err)) from err
 
-    hass.data.setdefault(DOMAIN, {})
-
-    address = entry.data[CONF_ADDRESS]
-    device_type = entry.data.get(CONF_DEVICE_TYPE) or f"PM5 {address}"
-
-    coordinator = PM5Coordinator(hass, address, device_type)
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    async def _finish_recordings(_event) -> None:
+        for coordinator in coordinators():
+            coordinator.recorder.close()
+        await manager.async_flush()
 
     hass.services.async_register(
         DOMAIN,
@@ -110,12 +159,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         schema=SERVICE_SCHEMA_CONNECT_HRM,
     )
 
-    await coordinator.session.start()
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_UPLOAD_WORKOUT,
+        _handle_upload_workout,
+        schema=vol.Schema(
+            {
+                vol.Required("workout_id"): cv.string,
+                vol.Required("garmin_entity_id"): cv.entity_id,
+                vol.Optional("retry", default=False): cv.boolean,
+                vol.Optional("upload_attempt"): cv.positive_int,
+            }
+        ),
+    )
+    await async_setup_panel(hass, get_devices, manager)
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _finish_recordings)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    domain_data = hass.data[DOMAIN]
+    address = entry.data[CONF_ADDRESS]
+    device_type = entry.data.get(CONF_DEVICE_TYPE) or f"PM5 {address}"
+    coordinator = PM5Coordinator(
+        hass, entry.title, address, device_type, domain_data[DATA_WORKOUT_MANAGER]
+    )
+    domain_data[entry.entry_id] = coordinator
+    try:
+        await coordinator.session.start()
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        domain_data.pop(entry.entry_id)
+        coordinator.recorder.close()
+        await coordinator.session.stop()
+        raise
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator: PM5Coordinator = hass.data[DOMAIN].pop(entry.entry_id)
-    await coordinator.session.stop()
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
+    domain_data = hass.data[DOMAIN]
+    coordinator: PM5Coordinator = domain_data.pop(entry.entry_id)
+    try:
+        await coordinator.session.stop()
+    finally:
+        coordinator.recorder.close()
+        await domain_data[DATA_WORKOUT_MANAGER].async_flush()
+    return True

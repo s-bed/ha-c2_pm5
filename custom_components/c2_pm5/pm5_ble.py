@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable
 
+from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 from bleak_retry_connector import (
     establish_connection,
     BleakClientWithServiceCache,
@@ -36,7 +38,6 @@ from .const import (
     CHAR_CSAFE_RX,
     CHAR_CSAFE_TX,
     CSAFE_COMMAND_WRAPPER_NONE,
-    CSAFE_COMMAND_WRAPPER_GETPMCFG,
     CSAFE_COMMAND_WRAPPER_GETPMDATA,
     CSAFE_COMMAND_WRAPPER_SETPMCFG,
     CSAFE_COMMAND_WRAPPER_SETPMDATA,
@@ -72,6 +73,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # https://www.concept2.com/support/software-development
+# https://www.concept2.nl/files/pdf/us/monitors/PM5_BluetoothSmartInterfaceDefinition.pdf
 # https://cms.concept2.com/sites/default/files/2024-05/PM5_CSAFECommunicationDefinition_0.pdf
 # https://www.concept2.sg/files/pdf/us/monitors/PM5_CSAFECommunicationDefinition.pdf
 
@@ -86,6 +88,11 @@ def u16_le(b: bytes, off: int) -> int:
 
 def u24_le(b: bytes, off: int) -> int:
     return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16)
+
+
+def heart_rate_bpm(value: int) -> int | None:
+    """Treat zero and the PM5 invalid sentinel as missing heart rate."""
+    return None if value in (0, 255) else value
 
 
 def csafe_xor_checksum(frame_contents: bytes) -> int:
@@ -229,6 +236,16 @@ class PM5BleSession:
         self._available_event = asyncio.Event()
         self._connected_event = asyncio.Event()
 
+    @property
+    def is_connected(self) -> bool:
+        """Return whether the monitor has an active telemetry connection."""
+        return self._connected
+
+    @property
+    def is_discoverable(self) -> bool:
+        """Return whether the monitor is reachable or was recently seen."""
+        return self._available
+
     # ---------- Cooldown helpers ----------
     def _in_cooldown(self) -> bool:
         if self._idle_disconnect_monotonic is None:
@@ -315,7 +332,7 @@ class PM5BleSession:
                 await asyncio.sleep(1)
 
                 try:
-                    await self._get_ble_device()
+                    self._get_ble_device()
                     discoverable = True
                 except PM5Unavailable:
                     discoverable = False
@@ -394,26 +411,17 @@ class PM5BleSession:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
-    async def _get_ble_device(self) -> BLEDevice:
-        scanner = bluetooth.async_get_scanner(self.hass)
-        dev = await scanner.find_device_by_address(self.address)
+    def _get_ble_device(self) -> BLEDevice:
+        dev = bluetooth.async_ble_device_from_address(
+            self.hass, self.address, connectable=True
+        )
         if dev is not None:
             return dev
         raise PM5Unavailable(f"PM5 not found in scanner cache: {self.address}")
 
     def _workout_looks_active(self) -> bool:
-        """
-        Decide whether it makes sense to attempt a 'terminate workout'.
-        We only try if we have a workout_state and it is not already in a terminal/terminated state.
-        """
-        ws = self._workout_state_raw
-        if ws is None:
-            return False
-
-        if ws in (11,):
-            return False
-
-        return True
+        """Return whether the PM5 reports work, a pause or an interval rest."""
+        return self._workout_state_raw in range(1, 10)
 
     # ---------- CSAFE ----------
 
@@ -657,10 +665,10 @@ class PM5BleSession:
             raise ValueError("user_number must be 0..4")
 
         if manufacturer_id < 0 or manufacturer_id > 255:
-            raise ValueError(f"manufacturer_id must be 0..255")
+            raise ValueError("manufacturer_id must be 0..255")
 
         if device_type_final < 0 or device_type_final > 1:
-            raise ValueError(f"device_type must be 0..1")
+            raise ValueError("device_type must be 0..1")
 
         if belt_id < 0 or belt_id > 0xFFFFFFFF:
             raise ValueError("belt_id must fit in 32-bit unsigned")
@@ -840,6 +848,24 @@ class PM5BleSession:
         except asyncio.CancelledError:
             return
 
+    async def _start_notify(
+        self,
+        client: BleakClientWithServiceCache,
+        subscriptions: set[str],
+        uuid: str,
+        handler: Callable[[str, bytearray], None],
+    ) -> bool:
+        def forward(_sender: BleakGATTCharacteristic, data: bytearray) -> None:
+            handler(uuid, data)
+
+        try:
+            await client.start_notify(uuid, forward)
+        except BleakError as err:
+            _LOGGER.debug("Could not subscribe to %s (%s): %s", uuid, self.address, err)
+            return False
+        subscriptions.add(uuid)
+        return True
+
     async def _connect_and_listen(self) -> None:
         if self._in_cooldown():
             raise PM5Unavailable(
@@ -849,7 +875,7 @@ class PM5BleSession:
         if not self._available:
             raise PM5Unavailable(f"PM5 not advertising: {self.address}")
 
-        ble_device = await self._get_ble_device()
+        ble_device = self._get_ble_device()
 
         disconnected = asyncio.Event()
         idle_disconnect = asyncio.Event()
@@ -858,13 +884,14 @@ class PM5BleSession:
         def _disconnected_callback(_client):
             loop.call_soon_threadsafe(disconnected.set)
 
-        self._client = await establish_connection(
+        client = self._client = await establish_connection(
             BleakClientWithServiceCache,
             ble_device,
             self.address,
             disconnected_callback=_disconnected_callback,
             max_attempts=2,
         )
+        subscriptions: set[str] = set()
 
         try:
             # Reset idle tracking on connect
@@ -872,53 +899,82 @@ class PM5BleSession:
             self._idle_disconnect_monotonic = None
             self._workout_state_raw = None
 
-            await self._client.start_notify(self._uuid33, self._handle_0033)
-            await self._client.start_notify(self._uuid35, self._handle_0035)
-            await self._client.start_notify(self._uuid39, self._handle_0039)
-            await self._client.start_notify(self._uuid3a, self._handle_003A)
-            await self._client.start_notify(self._uuid80, self._handle_0080)
-            await self._client.start_notify(self._uuid_csafe_tx, self._handle_csafe_tx)
+            multiplexed = await self._start_notify(
+                client, subscriptions, self._uuid80, self._handle_0080
+            )
+            # The PM5 keeps a metric on the multiplexed stream until its direct
+            # notification is enabled. Prefer direct packets where they carry more data.
+            if not multiplexed:
+                for uuid, handler in (
+                    (self._uuid31, self._handle_0031),
+                    (self._uuid32, self._handle_0032),
+                ):
+                    if not await self._start_notify(client, subscriptions, uuid, handler):
+                        raise BleakConnectionError(
+                            f"PM5 live workout stream unavailable: {uuid} ({self.address})"
+                        )
+                await self._start_notify(
+                    client, subscriptions, self._uuid36, self._handle_0036
+                )
+            for uuid, handler in (
+                (self._uuid39, self._handle_0039),
+                (self._uuid3a, self._handle_003A),
+                (self._uuid33, self._handle_0033),
+                (self._uuid35, self._handle_0035),
+            ):
+                await self._start_notify(client, subscriptions, uuid, handler)
+
+            has_csafe_tx = await self._start_notify(
+                client, subscriptions, self._uuid_csafe_tx, self._handle_csafe_tx
+            )
+            has_csafe_rx = (
+                client.services.get_characteristic(self._uuid_csafe_rx) is not None
+            )
+            if not multiplexed:
+                for uuid, handler in (
+                    (self._uuid37, self._handle_0037),
+                    (self._uuid38, self._handle_0038),
+                ):
+                    await self._start_notify(client, subscriptions, uuid, handler)
 
             _LOGGER.info("Connected to PM5 (%s)", self.address)
             self._set_connected(True)
 
-            try:
-                await self._sync_datetime()
-            except Exception:
-                _LOGGER.exception(
-                    "Unexpected error during PM5 datetime sync (%s)", self.address
+            if has_csafe_rx:
+                try:
+                    await self._sync_datetime()
+                except Exception:
+                    _LOGGER.exception(
+                        "Unexpected error during PM5 datetime sync (%s)", self.address
+                    )
+
+            tasks = {
+                asyncio.create_task(disconnected.wait()),
+                asyncio.create_task(idle_disconnect.wait()),
+                asyncio.create_task(self._idle_watchdog(idle_disconnect)),
+                asyncio.create_task(self._stop.wait()),
+            }
+            if has_csafe_rx and has_csafe_tx:
+                tasks.update(
+                    (
+                        asyncio.create_task(
+                            self._poll_loop(
+                                initial_delay=0.0,
+                                interval=HRM_POLL_SECONDS,
+                                fn=self.poll_hrbelt_info_once,
+                            )
+                        ),
+                        asyncio.create_task(
+                            self._poll_loop(
+                                initial_delay=2.0,
+                                interval=BATTERY_POLL_SECONDS,
+                                fn=self.poll_battery_once,
+                            )
+                        ),
+                    )
                 )
 
-            disconnect_task = asyncio.create_task(disconnected.wait())
-            idle_event_task = asyncio.create_task(idle_disconnect.wait())
-            idle_task = asyncio.create_task(self._idle_watchdog(idle_disconnect))
-            stop_task = asyncio.create_task(self._stop.wait())
-            poll_hrm_task = asyncio.create_task(
-                self._poll_loop(
-                    initial_delay=0.0,
-                    interval=HRM_POLL_SECONDS,
-                    fn=self.poll_hrbelt_info_once,
-                )
-            )
-            poll_battery_task = asyncio.create_task(
-                self._poll_loop(
-                    initial_delay=2.0,
-                    interval=BATTERY_POLL_SECONDS,
-                    fn=self.poll_battery_once,
-                )
-            )
-
-            done, pending = await asyncio.wait(
-                {
-                    disconnect_task,
-                    idle_event_task,
-                    idle_task,
-                    stop_task,
-                    poll_hrm_task,
-                    poll_battery_task,
-                },
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
             for task in pending:
                 task.cancel()
@@ -931,17 +987,17 @@ class PM5BleSession:
                     self.address,
                 )
 
-                # Try to terminate workout first
                 try:
-                    await self._terminate_workout()
+                    terminated = has_csafe_rx and await self._terminate_workout()
                 except Exception:
+                    terminated = False
                     _LOGGER.exception(
                         "Unexpected error during PM5 workout termination (%s)",
                         self.address,
                     )
 
                 # Give PM a moment to emit end-of-workout summaries (0039/003A)
-                if not self._stop.is_set():
+                if terminated and not self._stop.is_set():
                     await asyncio.sleep(TERMINATE_GRACE_SECONDS)
 
                 self._idle_disconnect_monotonic = time.monotonic()
@@ -952,27 +1008,17 @@ class PM5BleSession:
 
             self._cancel_pending_csafe()
 
-            client = self._client
             self._client = None  # break reference cycles ASAP
 
-            if client is not None:
-                # Best-effort notify stop
-                for uuid in (
-                    self._uuid33,
-                    self._uuid35,
-                    self._uuid39,
-                    self._uuid3a,
-                    self._uuid80,
-                    self._uuid_csafe_tx,
-                ):
-                    try:
-                        await client.stop_notify(uuid)
-                    except Exception:
-                        pass
+            for uuid in subscriptions:
                 try:
-                    await client.disconnect()
+                    await client.stop_notify(uuid)
                 except Exception:
                     pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     # ---------- Notification Parsers ----------
     def _bump_seen(self) -> None:
@@ -993,33 +1039,37 @@ class PM5BleSession:
             _LOGGER.debug("CSAFE TX parse error (%s): %s", self.address, err)
 
     # 0x0080 (variable) Multiplexed information
-    def _handle_0080(self, _uuid: str, data: bytearray) -> None:
+    def _handle_0080(self, uuid: str, data: bytearray) -> None:
+        if not data:
+            return
+
         cmd = data[0]
+        payload = data[1:]
         match cmd:
             case 0x31:
-                self._handle_0031(_uuid, data[1:])
+                self._handle_0031(uuid, payload)
             case 0x32:
-                self._handle_0032(_uuid, data[1:])
+                self._handle_0032(uuid, payload)
             case 0x33:
-                self._handle_0033(_uuid, data[1:])
+                self._handle_0033(uuid, payload)
             case 0x35:
-                self._handle_0035(_uuid, data[1:])
+                self._handle_0035(uuid, payload)
             case 0x36:
-                self._handle_0036(_uuid, data[1:])
+                self._handle_0036(uuid, payload)
             case 0x37:
-                self._handle_0037(_uuid, data[1:])
+                self._handle_0037(uuid, payload)
             case 0x38:
-                self._handle_0038(_uuid, data[1:])
+                self._handle_0038(uuid, payload)
             case 0x39:
-                self._handle_0039(_uuid, data[1:])
+                self._handle_0039(uuid, payload)
             case 0x3A:
-                self._handle_003A(_uuid, data[1:])
+                self._handle_003A(uuid, payload)
             case _:
                 _LOGGER.debug(
                     "Received unhandled multiplex command (%s): %s -> %s",
                     self.address,
                     hex(cmd),
-                    data[1:].hex(),
+                    payload.hex(),
                 )
 
     # 0x0031 (19 bytes) Rowing general status
@@ -1027,7 +1077,7 @@ class PM5BleSession:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 19 and _uuid in (self._uuid31, self._uuid80):
+        if len(b) != 19:
             _LOGGER.debug("Received unexpected length 0x0031 notify: %s", b.hex())
             return
 
@@ -1079,7 +1129,9 @@ class PM5BleSession:
                     "0031_workout_type": workout_type,
                     "0031_interval_type": interval_type,
                     "0031_workout_state": workout_state,
+                    "0031_workout_state_raw": workout_state_raw,
                     "0031_rowing_state": rowing_state,
+                    "0031_rowing_state_raw": rowing_state_raw,
                     "0031_stroke_state": stroke_state,
                     "0031_total_work_distance_m": total_work_distance_m,
                     "0031_workout_duration": (
@@ -1093,38 +1145,29 @@ class PM5BleSession:
             )
         )
 
-    # 0x0032 (17-19 bytes) Rowing additional status 1
-    def _handle_0032(self, _uuid: str, data: bytearray) -> None:
+    # 0x0032 Rowing additional status 1
+    def _handle_0032(self, uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 19 and _uuid == self._uuid80:
-            _LOGGER.debug("Received unexpected length 0x0032 notify: %s", b.hex())
-            return
-        elif len(b) != 17 and _uuid == self._uuid32:
+        multiplexed = uuid == self._uuid80
+        base_size = 18 if multiplexed else 16
+        if len(b) not in (base_size, base_size + 1):
             _LOGGER.debug("Received unexpected length 0x0032 notify: %s", b.hex())
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
         speed_m_s = u16_le(b, 3) / 1000.0
         stroke_rate_spm = b[5]
-        heart_rate_bpm = None if b[6] == 255 else b[6]
         current_pace_s_per_500m = u16_le(b, 7) / 100.0
         average_pace_s_per_500m = u16_le(b, 9) / 100.0
         rest_distance_m = u16_le(b, 11)
         rest_time_s = u24_le(b, 13) / 100.0
-        if len(b) < 19:
-            avg_power_w = None
-            erg_type_raw = b[16]
-            erg_type = try_lookup(
-                self.address, "erg type", ERG_MACHINE_TYPE, erg_type_raw
-            )
-        else:
-            avg_power_w = u16_le(b, 16)
-            erg_type_raw = b[18]
-            erg_type = try_lookup(
-                self.address, "erg type", ERG_MACHINE_TYPE, erg_type_raw
-            )
+        avg_power_w = u16_le(b, 16) if multiplexed else None
+        erg_type = (
+            try_lookup(self.address, "erg type", ERG_MACHINE_TYPE, b[base_size])
+            if len(b) > base_size else None
+        )
 
         self.on_data(
             PM5Data(
@@ -1132,7 +1175,7 @@ class PM5BleSession:
                     "0032_elapsed_time_s": elapsed_time_s,
                     "0032_speed_m_s": speed_m_s,
                     "0032_stroke_rate_spm": stroke_rate_spm,
-                    "0032_heart_rate_bpm": heart_rate_bpm,
+                    "0032_heart_rate_bpm": heart_rate_bpm(b[6]),
                     "0032_current_pace_s_per_500m": current_pace_s_per_500m,
                     "0032_average_pace_s_per_500m": average_pace_s_per_500m,
                     "0032_rest_distance_m": rest_distance_m,
@@ -1144,14 +1187,11 @@ class PM5BleSession:
         )
 
     # 0x0033 (18-20 bytes) Rowing additional status 2
-    def _handle_0033(self, _uuid: str, data: bytearray) -> None:
+    def _handle_0033(self, uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 20 and _uuid == self._uuid33:
-            _LOGGER.debug("Received unexpected length 0x0033 notify: %s", b.hex())
-            return
-        elif len(b) != 18 and _uuid == self._uuid80:
+        if len(b) != (18 if uuid == self._uuid80 else 20):
             _LOGGER.debug("Received unexpected length 0x0033 notify: %s", b.hex())
             return
 
@@ -1191,14 +1231,11 @@ class PM5BleSession:
         )
 
     # 0x0035 (18-20 bytes) Stroke data
-    def _handle_0035(self, _uuid: str, data: bytearray) -> None:
+    def _handle_0035(self, uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 20 and _uuid == self._uuid35:
-            _LOGGER.debug("Received unexpected length 0x0035 notify: %s", b.hex())
-            return
-        elif len(b) != 18 and _uuid == self._uuid80:
+        if len(b) != (18 if uuid == self._uuid80 else 20):
             _LOGGER.debug("Received unexpected length 0x0035 notify: %s", b.hex())
             return
 
@@ -1235,14 +1272,11 @@ class PM5BleSession:
         )
 
     # 0x0036 (15-17 bytes) Stroke data
-    def _handle_0036(self, _uuid: str, data: bytearray) -> None:
+    def _handle_0036(self, uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 17 and _uuid == self._uuid80:
-            _LOGGER.debug("Received unexpected length 0x0036 notify: %s", b.hex())
-            return
-        elif len(b) != 15 and _uuid == self._uuid36:
+        if len(b) != (17 if uuid == self._uuid80 else 15):
             _LOGGER.debug("Received unexpected length 0x0036 notify: %s", b.hex())
             return
 
@@ -1283,8 +1317,8 @@ class PM5BleSession:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 18 and _uuid in (self._uuid37, self._uuid80):
-            _LOGGER.debug("Received unexpected length 0x0038 notify: %s", b.hex())
+        if len(b) != 18:
+            _LOGGER.debug("Received unexpected length 0x0037 notify: %s", b.hex())
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
@@ -1314,19 +1348,17 @@ class PM5BleSession:
             )
         )
 
-    # 0x0038 (19 bytes) Split/interval data
+    # 0x0038 (18-19 bytes) Split/interval data
     def _handle_0038(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 19 and _uuid in (self._uuid38, self._uuid80):
+        if len(b) not in (18, 19):
             _LOGGER.debug("Received unexpected length 0x0038 notify: %s", b.hex())
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
         split_interval_avg_stroke_rate_spm = b[3]
-        split_interval_work_heart_rate_bpm = b[4]
-        split_interval_rest_heart_rate_bpm = b[5]
         split_interval_avg_pace_s_per_500m = u16_le(b, 6) / 10.0
         split_interval_total_calories = u16_le(b, 8)
         split_interval_avg_calories_hr = u16_le(b, 10)
@@ -1334,24 +1366,18 @@ class PM5BleSession:
         split_interval_power_w = u16_le(b, 14)
         split_avg_drag_factor = b[16]
         split_interval_number = b[17]
-        erg_type_raw = b[18]
-        erg_type = try_lookup(self.address, "erg type", ERG_MACHINE_TYPE, erg_type_raw)
+        erg_type = (
+            try_lookup(self.address, "erg type", ERG_MACHINE_TYPE, b[18])
+            if len(b) == 19 else None
+        )
 
         self.on_data(
             PM5Data(
                 {
                     "0038_elapsed_time_s": elapsed_time_s,
                     "0038_split_interval_avg_stroke_rate_spm": split_interval_avg_stroke_rate_spm,
-                    "0038_split_interval_work_heart_rate_bpm": (
-                        None
-                        if split_interval_work_heart_rate_bpm in (0, 255)
-                        else split_interval_work_heart_rate_bpm
-                    ),
-                    "0038_split_interval_rest_heart_rate_bpm": (
-                        None
-                        if split_interval_rest_heart_rate_bpm in (0, 255)
-                        else split_interval_rest_heart_rate_bpm
-                    ),
+                    "0038_split_interval_work_heart_rate_bpm": heart_rate_bpm(b[4]),
+                    "0038_split_interval_rest_heart_rate_bpm": heart_rate_bpm(b[5]),
                     "0038_split_interval_avg_pace_s_per_500m": split_interval_avg_pace_s_per_500m,
                     "0038_split_interval_total_calories": split_interval_total_calories,
                     "0038_split_interval_avg_calories_hr": split_interval_avg_calories_hr,
@@ -1365,14 +1391,11 @@ class PM5BleSession:
         )
 
     # 0x0039 (18-20 bytes) End-of-workout summary
-    def _handle_0039(self, _uuid: str, data: bytearray) -> None:
+    def _handle_0039(self, uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 20 and _uuid == self._uuid39:
-            _LOGGER.debug("Received unexpected length 0x0039 notify: %s", b.hex())
-            return
-        elif len(b) != 18 and _uuid == self._uuid80:
+        if len(b) != (18 if uuid == self._uuid80 else 20):
             _LOGGER.debug("Received unexpected length 0x0039 notify: %s", b.hex())
             return
 
@@ -1381,12 +1404,7 @@ class PM5BleSession:
         elapsed_s = u24_le(b, 4) / 100.0
         distance_m = u24_le(b, 7) / 10.0
         avg_stroke_rate = b[10]
-        ending_hr = b[11]
-        avg_hr = b[12]
-        min_hr = b[13]
-        max_hr = b[14]
         drag_avg = b[15]
-        recovery_hr = b[16]
         workout_type_raw = b[17]
         workout_type = try_lookup(
             self.address, "workout type", WORKOUT_TYPE, workout_type_raw
@@ -1404,16 +1422,12 @@ class PM5BleSession:
                     "0039_elapsed_time_s": elapsed_s,
                     "0039_distance_m": distance_m,
                     "0039_avg_stroke_rate_spm": avg_stroke_rate,
-                    "0039_ending_heart_rate_bpm": (
-                        None if ending_hr in (0, 255) else ending_hr
-                    ),
-                    "0039_avg_heart_rate_bpm": (None if avg_hr in (0, 255) else avg_hr),
-                    "0039_min_heart_rate_bpm": (None if min_hr in (0, 255) else min_hr),
-                    "0039_max_heart_rate_bpm": (None if max_hr in (0, 255) else max_hr),
+                    "0039_ending_heart_rate_bpm": heart_rate_bpm(b[11]),
+                    "0039_avg_heart_rate_bpm": heart_rate_bpm(b[12]),
+                    "0039_min_heart_rate_bpm": heart_rate_bpm(b[13]),
+                    "0039_max_heart_rate_bpm": heart_rate_bpm(b[14]),
                     "0039_drag_factor_avg": drag_avg,
-                    "0039_recovery_heart_rate_bpm": (
-                        None if recovery_hr in (0, 255) else recovery_hr
-                    ),
+                    "0039_recovery_heart_rate_bpm": heart_rate_bpm(b[16]),
                     "0039_workout_type": workout_type,
                     "0039_avg_pace_s_per_500m": avg_pace_s_per_500m,
                 }
@@ -1421,14 +1435,11 @@ class PM5BleSession:
         )
 
     # 0x003A (18-19 bytes) End-of-workout additional summary
-    def _handle_003A(self, _uuid: str, data: bytearray) -> None:
+    def _handle_003A(self, uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) != 19 and _uuid == self._uuid3a:
-            _LOGGER.debug("Received unexpected length 0x003A notify: %s", b.hex())
-            return
-        elif len(b) != 18 and _uuid == self._uuid80:
+        if len(b) != (18 if uuid == self._uuid80 else 19):
             _LOGGER.debug("Received unexpected length 0x003A notify: %s", b.hex())
             return
 

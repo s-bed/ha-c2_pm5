@@ -11,10 +11,10 @@
   ],
   "codeowners": ["@doug-hoffman"],
   "config_flow": true,
-  "dependencies": ["bluetooth_adapters"],
-  "documentation": "https://github.com/doug-hoffman/ha-c2_pm5",
+  "dependencies": ["bluetooth", "bluetooth_adapters", "frontend", "http", "panel_custom", "websocket_api"],
+  "documentation": "https://github.com/s-bed/ha-c2_pm5",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/doug-hoffman/ha-c2_pm5/issues",
-  "requirements": [],
-  "version": "2026.1.0"
+  "requirements": ["garmin-fit-sdk==21.221.0"],
+  "version": "2026.11.0"
 }
