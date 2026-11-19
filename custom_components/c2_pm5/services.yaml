@@ -33,3 +33,35 @@ connect_hrm:
           min: 0
           max: 4294967295
           mode: box
+
+upload_workout:
+  name: Upload workout to Garmin
+  description: Upload a saved PM5 rowing workout to the selected Garmin Connect account.
+  fields:
+    workout_id:
+      name: Workout ID
+      description: Identifier of a workout saved on the Concept2 PM5 status page.
+      required: true
+      selector:
+        text:
+    garmin_entity_id:
+      name: Garmin account
+      description: A Garmin Connect sensor belonging to the destination account.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+          integration: garmin_connect
+    retry:
+      name: Retry after checking Garmin
+      description: Use only after checking that the previous attempt did not create the activity.
+      default: false
+      selector:
+        boolean:
+    upload_attempt:
+      name: Previous upload attempt
+      description: Required when retrying an upload with an uncertain outcome.
+      selector:
+        number:
+          min: 1
+          mode: box

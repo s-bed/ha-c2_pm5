@@ -10,6 +10,62 @@ on:
 permissions: {}
 
 jobs:
+  validate-release:
+    name: Validate the Marketplace package on Home Assistant 2026.11
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Build the package and release notes
+        run: python .github/scripts/build_release.py "$RUNNER_TEMP"
+      - name: Install Home Assistant and integration dependencies
+        run: >-
+          python -m pip install
+          homeassistant==2026.11.0
+          home-assistant-frontend==20261028.4
+          garmin-fit-sdk==21.221.0
+          bleak==3.0.2
+          bleak-retry-connector==4.7.1
+          bluetooth-adapters==2.4.0
+          bluetooth-auto-recovery==1.6.4
+          bluetooth-data-tools==1.29.24
+          dbus-fast==5.0.22
+          habluetooth==7.1.2
+      - name: Set up the packaged integration
+        run: |
+          package_root="$RUNNER_TEMP/pm5-smoke"
+          python -m zipfile -e "$RUNNER_TEMP/c2_pm5.zip" "$package_root/custom_components/c2_pm5"
+          cd "$package_root"
+          python - <<'PY'
+          import asyncio
+          from tempfile import TemporaryDirectory
+          from types import SimpleNamespace
+          from unittest.mock import AsyncMock
+
+          from homeassistant.components import frontend
+          from homeassistant.core import HomeAssistant
+
+          from custom_components.c2_pm5 import async_setup, config_flow, sensor
+
+          async def check():
+              with TemporaryDirectory() as config_dir:
+                  hass = HomeAssistant(config_dir)
+                  hass.http = SimpleNamespace(async_register_static_paths=AsyncMock())
+                  assert await async_setup(hass, {})
+                  assert frontend.async_panel_exists(hass, "concept2-pm5")
+                  assert hass.services.has_service("c2_pm5", "upload_workout")
+                  hass.http.async_register_static_paths.assert_awaited_once()
+
+          asyncio.run(check())
+          PY
+
   validate-hassfest:
     runs-on: "ubuntu-latest"
     steps:
