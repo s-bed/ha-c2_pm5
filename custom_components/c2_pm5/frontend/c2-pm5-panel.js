@@ -360,8 +360,11 @@ class Concept2Panel extends HTMLElement {
       metric("Max. heart rate", number(workout.max_heart_rate_bpm, "bpm")),
     );
     panel.replaceChildren(title, monitor, metrics);
-    if (workout.partial) {
-      panel.append(element("p", "Partial recording", "notice muted"));
+    if (workout.summary_only && workout.summary_source === "memory") {
+      panel.append(element("p", "Recovered from PM5 Memory · Summary only", "notice muted"));
+    } else if (workout.partial) {
+      const label = workout.summary_only ? "Partial recording · PM5 summary only" : "Partial recording";
+      panel.append(element("p", label, "notice muted"));
     }
     const heartRateSamples = workout.heart_rate_sample_count || 0;
     const sampleCount = workout.sample_count || 0;

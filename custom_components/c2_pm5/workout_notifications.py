@@ -115,7 +115,9 @@ class WorkoutNotifications:
             message = (
                 f"{minutes}:{seconds:02d} elapsed, {workout['distance_m']:,.0f} m."
             )
-            if workout["partial"]:
+            if workout.get("summary_only"):
+                message += " Partial recording · PM5 summary only."
+            elif workout["partial"]:
                 message += " Partial recording."
             path = f"/{PANEL_PATH}?workout={workout_id}"
             prefix = f"{DOMAIN}|{workout_id}|{prompt.token}|"

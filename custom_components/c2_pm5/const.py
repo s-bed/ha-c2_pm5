@@ -4,11 +4,12 @@
 
 DOMAIN = "c2_pm5"
 
-PLATFORMS = ["sensor"]
+PLATFORMS = ["sensor", "number"]
 
 CONF_ADDRESS = "address"
 CONF_DEVICE_TYPE = "device_type"
 CONF_GARMIN_ACCOUNT = "garmin_account"
+CONF_IDLE_DISCONNECT_MINUTES = "idle_disconnect_minutes"
 CONF_NOTIFICATION_DEVICE = "notification_device"
 
 # User-selectable device types
@@ -25,7 +26,7 @@ SIGNAL_WORKOUT_UPDATED = f"{DOMAIN}_workout_updated"
 
 # Device availability / reconnect behavior
 DEVICE_STALE_SECONDS = 30
-IDLE_DISCONNECT_SECONDS = 15 * 60  # 15 minutes
+DEFAULT_IDLE_DISCONNECT_MINUTES = 5
 IDLE_DISCONNECT_COOLDOWN_SECONDS = 90
 
 # GATT characteristics

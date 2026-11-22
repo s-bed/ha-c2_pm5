@@ -18,8 +18,9 @@ from bleak_retry_connector import (
     BleakConnectionError,
 )
 
-from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback
 from homeassistant.components import bluetooth
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -37,7 +38,9 @@ from .const import (
     CHAR_0080,
     CHAR_CSAFE_RX,
     CHAR_CSAFE_TX,
+    CONF_IDLE_DISCONNECT_MINUTES,
     CSAFE_COMMAND_WRAPPER_NONE,
+    CSAFE_COMMAND_WRAPPER_GETPMCFG,
     CSAFE_COMMAND_WRAPPER_GETPMDATA,
     CSAFE_COMMAND_WRAPPER_SETPMCFG,
     CSAFE_COMMAND_WRAPPER_SETPMDATA,
@@ -54,12 +57,12 @@ from .const import (
     DATETIME_SYNC_CONNECT_GRACE_SECONDS,
     DATETIME_SYNC_RATE_LIMIT_SECONDS,
     DATETIME_SYNC_TIMEOUT_SECONDS,
+    DEFAULT_IDLE_DISCONNECT_MINUTES,
     DEVICE_STALE_SECONDS,
     ERG_MACHINE_TYPE,
     HRM_DEVICE_TYPE,
     HRM_POLL_SECONDS,
     IDLE_DISCONNECT_COOLDOWN_SECONDS,
-    IDLE_DISCONNECT_SECONDS,
     INTERVAL_TYPE,
     ROWING_STATE,
     STROKE_STATE,
@@ -71,6 +74,13 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_CSAFE_MAX_FRAME_BYTES = 120  # Includes flags, checksum and byte stuffing.
+_CSAFE_WRAPPERS = {
+    CSAFE_COMMAND_WRAPPER_GETPMCFG,
+    CSAFE_COMMAND_WRAPPER_GETPMDATA,
+    CSAFE_COMMAND_WRAPPER_SETPMCFG,
+    CSAFE_COMMAND_WRAPPER_SETPMDATA,
+}
 
 # https://www.concept2.com/support/software-development
 # https://www.concept2.nl/files/pdf/us/monitors/PM5_BluetoothSmartInterfaceDefinition.pdf
@@ -165,6 +175,22 @@ def build_csafe_standard_frame(frame_contents: bytes) -> bytes:
     return bytes([CSAFE_STD_START]) + stuffed + bytes([CSAFE_STOP])
 
 
+def _response_chunks(payload: bytes, *, allow_bare_ack: bool = False):
+    """Read complete command responses within one frame or wrapper."""
+    index = 0
+    while index < len(payload):
+        if index + 1 == len(payload) and allow_bare_ack:
+            yield payload[index:]
+            return
+        if index + 1 >= len(payload):
+            raise ValueError("Missing CSAFE response length")
+        end = index + 2 + payload[index + 1]
+        if end > len(payload):
+            raise ValueError("Truncated CSAFE response")
+        yield payload[index:end]
+        index = end
+
+
 def try_lookup(address: str, name: str, data: dict, key: str):
     try:
         return data[key]
@@ -192,9 +218,12 @@ class PM5BleSession:
         address: str,
         on_data: Callable[[PM5Data], None],
         on_available: Callable[[bool], None],
+        *,
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         self.hass = hass
         self.address = address.upper()
+        self._config_entry = config_entry
         self.on_data = on_data
         self.on_available = on_available
 
@@ -219,21 +248,23 @@ class PM5BleSession:
 
         # CSAFE send guards
         self._csafe_lock = asyncio.Lock()
-        self._pending_csafe: dict[int, asyncio.Future[bytes]] = {}
+        self._pending_csafe: dict[tuple[int, int], asyncio.Future[bytes]] = {}
+        self._csafe_rx_buffer = bytearray()
         self._last_terminate_attempt_monotonic: float = 0.0
         self._last_datetime_sync_monotonic: float = 0.0
 
         self._available: bool = False
         self._avail_task: asyncio.Task | None = None
         self._connected: bool = False
-        self._idle_disconnect_monotonic: float | None = None
+        self.supports_memory_reads = False
+        self._reconnect_after: float = 0.0
         self._last_active_monotonic: float | None = None
-        self._last_seen_monotonic: float | None = None
         self._unsub_adv: CALLBACK_TYPE | None = None
         self._workout_state_raw: int | None = None
+        self._last_screen_status: tuple[int, int, int] | None = None
 
-        # Event used to wake the connect loop immediately when rediscovered
-        self._available_event = asyncio.Event()
+        # Edges wake a retry once. Repeated advertisements do not bypass backoff.
+        self._presence_changed = asyncio.Event()
         self._connected_event = asyncio.Event()
 
     @property
@@ -245,23 +276,6 @@ class PM5BleSession:
     def is_discoverable(self) -> bool:
         """Return whether the monitor is reachable or was recently seen."""
         return self._available
-
-    # ---------- Cooldown helpers ----------
-    def _in_cooldown(self) -> bool:
-        if self._idle_disconnect_monotonic is None:
-            return False
-        return time.monotonic() < (
-            self._idle_disconnect_monotonic + IDLE_DISCONNECT_COOLDOWN_SECONDS
-        )
-
-    def _cooldown_remaining(self) -> float:
-        if self._idle_disconnect_monotonic is None:
-            return 0.0
-        return max(
-            0.0,
-            (self._idle_disconnect_monotonic + IDLE_DISCONNECT_COOLDOWN_SECONDS)
-            - time.monotonic(),
-        )
 
     async def start(self) -> None:
         self._stop.clear()
@@ -278,6 +292,7 @@ class PM5BleSession:
 
     async def stop(self) -> None:
         self._stop.set()
+        self._presence_changed.set()
 
         if self._unsub_adv:
             self._unsub_adv()
@@ -302,17 +317,36 @@ class PM5BleSession:
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        self._last_seen_monotonic = time.monotonic()
+        self._refresh_availability()
+
+    def _refresh_availability(self) -> None:
+        if self._client is not None:
+            return
+        # The registration callback can replay old history or skip identical
+        # advertisements. HA still updates the timestamp of its connectable path.
+        info = bluetooth.async_last_service_info(
+            self.hass, self.address, connectable=True
+        )
+        fresh = (
+            info is not None
+            and info.time >= self._reconnect_after
+            and time.monotonic() - info.time <= DEVICE_STALE_SECONDS
+        )
+        if fresh and not self._available:
+            _LOGGER.debug(
+                "Detected PM5 (%s) via %s, RSSI %s dBm",
+                self.address,
+                info.source,
+                info.rssi,
+            )
+        self._set_available(fresh)
 
     def _set_available(self, available: bool) -> None:
         if self._available == available:
             return
 
         self._available = available
-        if available:
-            self._available_event.set()
-        else:
-            self._available_event.clear()
+        self._presence_changed.set()
 
     def _set_connected(self, connected: bool) -> None:
         if self._connected == connected:
@@ -329,20 +363,8 @@ class PM5BleSession:
     async def _availability_watchdog(self) -> None:
         try:
             while not self._stop.is_set():
+                self._refresh_availability()
                 await asyncio.sleep(1)
-
-                try:
-                    self._get_ble_device()
-                    discoverable = True
-                except PM5Unavailable:
-                    discoverable = False
-
-                if self._last_seen_monotonic is None:
-                    self._set_available(discoverable)
-                    continue
-
-                age = time.monotonic() - self._last_seen_monotonic
-                self._set_available(discoverable or age <= DEVICE_STALE_SECONDS)
         except asyncio.CancelledError:
             return
 
@@ -350,66 +372,47 @@ class PM5BleSession:
     async def _run(self) -> None:
         backoff = 1
         while not self._stop.is_set():
+            self._refresh_availability()
+            self._presence_changed.clear()
+            if not self._available:
+                backoff = 1
+                await self._presence_changed.wait()
+                continue
+
+            started = time.monotonic()
+            _LOGGER.debug("Starting PM5 connection attempt (%s)", self.address)
             try:
-                self._set_connected(False)
                 await self._connect_and_listen()
                 backoff = 1
-
             except (
                 BleakOutOfConnectionSlotsError,
                 BleakNotFoundError,
                 BleakConnectionError,
-            ):
-                pass
-
-            except PM5Unavailable as err:
-                _LOGGER.debug("%s", err)
-
-                if self._in_cooldown():
-                    _LOGGER.warning("Waiting for PM5 to shut down (%s)", self.address)
-                    remaining = self._cooldown_remaining()
-                    stop_task = asyncio.create_task(self._stop.wait())
-                    cooldown_task = asyncio.create_task(asyncio.sleep(remaining))
-                    done, pending = await asyncio.wait(
-                        {stop_task, cooldown_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-
-                    # Remove from cache so we only try to reconnect if it continues to advertise itself
-                    bluetooth.async_clear_address_from_match_history(
-                        self.hass, self.address
-                    )
-                    self._last_seen_monotonic = None
-                    self._set_available(False)
-
-                if not self._available:
-                    _LOGGER.info(
-                        "Waiting for PM5 to become available (%s)", self.address
-                    )
-                    stop_task = asyncio.create_task(self._stop.wait())
-                    avail_task = asyncio.create_task(self._available_event.wait())
-                    done, pending = await asyncio.wait(
-                        {stop_task, avail_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-
+                PM5Unavailable,
+            ) as err:
+                _LOGGER.debug(
+                    "PM5 connection attempt failed (%s) after %.1fs: %s: %s",
+                    self.address,
+                    time.monotonic() - started,
+                    type(err).__name__,
+                    err,
+                )
             except Exception as err:
                 _LOGGER.exception("PM5 BLE error (%s): %s", self.address, err)
 
-            self._set_connected(False)
-
             if self._stop.is_set():
                 break
-
-            if self._available:
-                await asyncio.sleep(backoff)
+            self._refresh_availability()
+            if not self._available or self._presence_changed.is_set():
+                backoff = 1
+                continue
+            _LOGGER.debug("Retrying PM5 connection (%s) in %ss", self.address, backoff)
+            try:
+                await asyncio.wait_for(self._presence_changed.wait(), timeout=backoff)
+            except TimeoutError:
                 backoff = min(backoff * 2, 30)
+            else:
+                backoff = 1
 
     def _get_ble_device(self) -> BLEDevice:
         dev = bluetooth.async_ble_device_from_address(
@@ -426,8 +429,7 @@ class PM5BleSession:
     # ---------- CSAFE ----------
 
     def _cancel_pending_csafe(self) -> None:
-        if not self._pending_csafe:
-            return
+        self._csafe_rx_buffer.clear()
         for fut in self._pending_csafe.values():
             if not fut.done():
                 fut.cancel()
@@ -441,7 +443,6 @@ class PM5BleSession:
         if not raw:
             raise ValueError("Empty CSAFE TX payload")
 
-        # Some stacks may deliver multiple frames or partials; PM5 BLE TX typically sends single frames.
         if raw[0] != CSAFE_STD_START or raw[-1] != CSAFE_STOP:
             raise ValueError(f"Not a CSAFE standard frame: {raw.hex()}")
 
@@ -458,57 +459,47 @@ class PM5BleSession:
         return contents
 
     def _consume_csafe_responses(self, contents: bytes) -> None:
-        """
-        Contents format in spec examples: [STATUS, <responses...>]
-        Response format is typically: [CMD, RESPONSE_BYTE_COUNT, <DATA...>]
-        Some responses may omit the count when 0; we handle both defensively.
-        """
-        if not contents:
-            return
-
+        """Validate response lengths and match the request's wrapper and command."""
         status = contents[0]
-        payload = contents[2:]
-
-        if (status & 0xF0) not in (0x00, 0x80):
-            _LOGGER.debug(
-                "CSAFE TX status indicates error (0x%02x): %s", status, contents.hex()
-            )
-
-        i = 0
-        while i < len(payload):
-            cmd = payload[i]
-            # If we can’t read a length byte, treat as zero-length response.
-            if i + 1 >= len(payload):
-                resp = bytes([cmd])
-                i += 1
+        if status & 0x30:
+            _LOGGER.debug("CSAFE TX returned status 0x%02x", status)
+            return
+        # Validate the entire frame before delivering any part of it.
+        responses = []
+        for outer in _response_chunks(contents[1:]):
+            command = outer[0]
+            if command in _CSAFE_WRAPPERS:
+                is_set = command in (
+                    CSAFE_COMMAND_WRAPPER_SETPMCFG, CSAFE_COMMAND_WRAPPER_SETPMDATA
+                )
+                for chunk in _response_chunks(outer[2:], allow_bare_ack=is_set):
+                    responses.append(((command, chunk[0]), chunk))
             else:
-                resp_len = payload[i + 1]
-                # If resp_len is nonsensical, fall back to “no-len” interpretation
-                if i + 2 + resp_len <= len(payload):
-                    resp = payload[i : i + 2 + resp_len]
-                    i += 2 + resp_len
-                else:
-                    resp = bytes([cmd])
-                    i += 1
-
-            fut = self._pending_csafe.get(cmd)
+                responses.append(((CSAFE_COMMAND_WRAPPER_NONE, command), outer))
+        for key, resp in responses:
+            fut = self._pending_csafe.get(key)
             if fut is not None and not fut.done():
                 fut.set_result(resp)
 
-    async def _send_csafe_frame(self, frame: bytes) -> None:
+    async def _send_csafe_frame(
+        self, frame: bytes, *, before_write: Callable[[], None] | None = None
+    ) -> None:
         """
         Write CSAFE frame to PM (0x0021).
 
         With ESPHome BT proxy / some BLE stacks, response=False can fail intermittently.
         Try response=False first for speed, then fallback to response=True.
         """
-        if not self._client:
+        client = self._client
+        if not client:
             raise PM5Unavailable("No BLE client")
 
         _LOGGER.debug("CSAFE RX (%s): %s", self.address, frame.hex())
 
+        if before_write is not None:
+            before_write()
         try:
-            await self._client.write_gatt_char(
+            await client.write_gatt_char(
                 self._uuid_csafe_rx, frame, response=False
             )
             return
@@ -517,12 +508,22 @@ class PM5BleSession:
                 "CSAFE write (response=False) failed; retrying response=True: %s", err
             )
 
-        await self._client.write_gatt_char(self._uuid_csafe_rx, frame, response=True)
+        if before_write is not None:
+            before_write()
+        await client.write_gatt_char(self._uuid_csafe_rx, frame, response=True)
 
-    async def _csafe_request(self, wrapper: int, cmd: int, data: bytes = b"") -> bytes:
+    async def _csafe_request(
+        self,
+        wrapper: int,
+        cmd: int,
+        data: bytes = b"",
+        *,
+        before_write: Callable[[], None] | None = None,
+        timeout: float = CSAFE_REQUEST_TIMEOUT_SECONDS,
+    ) -> bytes:
         """
         Send a CSAFE command and await the corresponding response from CSAFE TX.
-        Correlates by command byte.
+        Correlates by wrapper and command byte.
 
         Returns the response chunk: [CMD, RESPONSE_LEN?, DATA...]
         """
@@ -536,14 +537,6 @@ class PM5BleSession:
             raise ValueError("Data passed for short command")
 
         async with self._csafe_lock:
-            # One in-flight request per command
-            prev = self._pending_csafe.get(cmd)
-            if prev is not None and not prev.done():
-                prev.cancel()
-
-            fut: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-            self._pending_csafe[cmd] = fut
-
             # Build contents (standard CSAFE behavior):
             # - no-arg “short get”: just [CMD]
             # - arg commands: [CMD, CMD_BYTE_COUNT, <DATA...>]
@@ -561,18 +554,16 @@ class PM5BleSession:
 
             frame = build_csafe_standard_frame(contents)
 
-            await self._send_csafe_frame(frame)
-
+            key = (wrapper, cmd)
+            fut: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+            self._pending_csafe[key] = fut
             try:
-                resp = await asyncio.wait_for(
-                    fut, timeout=CSAFE_REQUEST_TIMEOUT_SECONDS
-                )
-                return resp
+                await self._send_csafe_frame(frame, before_write=before_write)
+                return await asyncio.wait_for(fut, timeout=timeout)
             finally:
-                # Keep dict clean
-                cur = self._pending_csafe.get(cmd)
-                if cur is fut:
-                    self._pending_csafe.pop(cmd, None)
+                self._pending_csafe.pop(key, None)
+                fut.cancel()
+                self._csafe_rx_buffer.clear()
 
     # ---------- Heartrate monitor ----------
     async def poll_hrbelt_info_once(self) -> None:
@@ -830,6 +821,14 @@ class PM5BleSession:
             _LOGGER.debug("Poll loop crashed (%s): %s", self.address, err)
 
     # ---------- Idle watchdog ----------
+    @property
+    def idle_disconnect_minutes(self) -> int:
+        if self._config_entry is None:
+            return DEFAULT_IDLE_DISCONNECT_MINUTES
+        return self._config_entry.options.get(
+            CONF_IDLE_DISCONNECT_MINUTES, DEFAULT_IDLE_DISCONNECT_MINUTES
+        )
+
     async def _idle_watchdog(self, idle_event: asyncio.Event) -> None:
         try:
             while not self._stop.is_set():
@@ -839,10 +838,19 @@ class PM5BleSession:
                 if last_active is None:
                     continue
 
-                idle_for = time.monotonic() - last_active
-                if idle_for < IDLE_DISCONNECT_SECONDS:
+                idle_minutes = self.idle_disconnect_minutes
+                idle_seconds = time.monotonic() - last_active
+                if idle_seconds < idle_minutes * 60:
                     continue
 
+                _LOGGER.warning(
+                    "PM5 idle for %.0f seconds (timeout %d minutes, workout state %s); "
+                    "disconnecting to allow sleep (%s)",
+                    idle_seconds,
+                    idle_minutes,
+                    self._workout_state_raw,
+                    self.address,
+                )
                 idle_event.set()
                 return
         except asyncio.CancelledError:
@@ -856,7 +864,8 @@ class PM5BleSession:
         handler: Callable[[str, bytearray], None],
     ) -> bool:
         def forward(_sender: BleakGATTCharacteristic, data: bytearray) -> None:
-            handler(uuid, data)
+            if self._client is client:
+                handler(uuid, data)
 
         try:
             await client.start_notify(uuid, forward)
@@ -867,15 +876,8 @@ class PM5BleSession:
         return True
 
     async def _connect_and_listen(self) -> None:
-        if self._in_cooldown():
-            raise PM5Unavailable(
-                f"Post-disconnect cooldown active ({self._cooldown_remaining():.1f}s remaining)"
-            )
-
-        if not self._available:
-            raise PM5Unavailable(f"PM5 not advertising: {self.address}")
-
         ble_device = self._get_ble_device()
+        started = time.monotonic()
 
         disconnected = asyncio.Event()
         idle_disconnect = asyncio.Event()
@@ -896,8 +898,14 @@ class PM5BleSession:
         try:
             # Reset idle tracking on connect
             self._last_active_monotonic = time.monotonic()
-            self._idle_disconnect_monotonic = None
             self._workout_state_raw = None
+            self._last_screen_status = None
+            self._set_available(True)
+            _LOGGER.debug(
+                "PM5 BLE link established (%s) in %.1fs",
+                self.address,
+                time.monotonic() - started,
+            )
 
             multiplexed = await self._start_notify(
                 client, subscriptions, self._uuid80, self._handle_0080
@@ -938,6 +946,13 @@ class PM5BleSession:
                     await self._start_notify(client, subscriptions, uuid, handler)
 
             _LOGGER.info("Connected to PM5 (%s)", self.address)
+            _LOGGER.debug(
+                "PM5 notifications ready (%s) after %.1fs (%s live stream)",
+                self.address,
+                time.monotonic() - started,
+                "multiplexed" if multiplexed else "direct",
+            )
+            self.supports_memory_reads = has_csafe_tx and has_csafe_rx
             self._set_connected(True)
 
             if has_csafe_rx:
@@ -981,12 +996,6 @@ class PM5BleSession:
             await asyncio.gather(*pending, return_exceptions=True)
 
             if idle_disconnect.is_set() and not self._stop.is_set():
-                _LOGGER.warning(
-                    "PM5 idle for %d minutes; disconnecting to allow sleep (%s)",
-                    IDLE_DISCONNECT_SECONDS // 60,
-                    self.address,
-                )
-
                 try:
                     terminated = has_csafe_rx and await self._terminate_workout()
                 except Exception:
@@ -1000,10 +1009,27 @@ class PM5BleSession:
                 if terminated and not self._stop.is_set():
                     await asyncio.sleep(TERMINATE_GRACE_SECONDS)
 
-                self._idle_disconnect_monotonic = time.monotonic()
+                self._reconnect_after = (
+                    time.monotonic() + IDLE_DISCONNECT_COOLDOWN_SECONDS
+                )
+                _LOGGER.debug(
+                    "Waiting for a new PM5 advertisement after the %ss sleep cooldown (%s)",
+                    IDLE_DISCONNECT_COOLDOWN_SECONDS,
+                    self.address,
+                )
 
         finally:
-            _LOGGER.info("PM5 disconnected (%s)", self.address)
+            if self._stop.is_set():
+                reason = "integration stop"
+            elif idle_disconnect.is_set():
+                reason = "idle timeout"
+            elif disconnected.is_set():
+                reason = "remote disconnect"
+            else:
+                reason = "connection cleanup"
+            teardown_started = time.monotonic()
+            _LOGGER.debug("Starting PM5 BLE teardown (%s): %s", self.address, reason)
+            self.supports_memory_reads = False
             self._set_connected(False)
 
             self._cancel_pending_csafe()
@@ -1013,30 +1039,52 @@ class PM5BleSession:
             for uuid in subscriptions:
                 try:
                     await client.stop_notify(uuid)
-                except Exception:
-                    pass
+                except Exception as err:
+                    _LOGGER.debug(
+                        "Could not stop PM5 notifications for %s (%s): %s",
+                        uuid,
+                        self.address,
+                        err,
+                    )
             try:
                 await client.disconnect()
-            except Exception:
-                pass
+            except Exception as err:
+                _LOGGER.warning(
+                    "PM5 BLE disconnect failed (%s) after %.1fs (%s): %s",
+                    self.address, time.monotonic() - teardown_started, reason, err,
+                )
+            else:
+                elapsed = time.monotonic() - teardown_started
+                if client.is_connected:
+                    _LOGGER.warning(
+                        "PM5 still reports connected after BLE teardown (%s) in %.1fs (%s)",
+                        self.address, elapsed, reason,
+                    )
+                else:
+                    _LOGGER.info(
+                        "PM5 BLE teardown complete (%s) in %.1fs (%s)",
+                        self.address, elapsed, reason,
+                    )
 
     # ---------- Notification Parsers ----------
-    def _bump_seen(self) -> None:
-        self._last_seen_monotonic = time.monotonic()
-        self._set_available(True)
-
     def _handle_csafe_tx(self, _uuid: str, data: bytearray) -> None:
-        """CSAFE TX notifications from PM (0x0022)."""
-        self._bump_seen()
-        raw = bytes(data)
-        _LOGGER.debug("CSAFE TX (%s): %s", self.address, raw.hex())
-
-        try:
-            contents = self._parse_csafe_standard_frame(raw)
-            self._consume_csafe_responses(contents)
-        except Exception as err:
-            # Don’t spam logs; this can happen if proxy delivers partials/concats
-            _LOGGER.debug("CSAFE TX parse error (%s): %s", self.address, err)
+        """Collect complete CSAFE frames across GATT notifications."""
+        buffer = self._csafe_rx_buffer
+        for byte in data:
+            if byte == CSAFE_STD_START:
+                buffer.clear()
+                buffer.append(byte)
+            elif byte == CSAFE_EXT_START or len(buffer) >= _CSAFE_MAX_FRAME_BYTES:
+                buffer.clear()
+            elif buffer:
+                buffer.append(byte)
+                if byte == CSAFE_STOP:
+                    try:
+                        contents = self._parse_csafe_standard_frame(bytes(buffer))
+                        self._consume_csafe_responses(contents)
+                    except ValueError as err:
+                        _LOGGER.debug("CSAFE TX parse error (%s): %s", self.address, err)
+                    buffer.clear()
 
     # 0x0080 (variable) Multiplexed information
     def _handle_0080(self, uuid: str, data: bytearray) -> None:
@@ -1064,6 +1112,18 @@ class PM5BleSession:
                 self._handle_0039(uuid, payload)
             case 0x3A:
                 self._handle_003A(uuid, payload)
+            case 0x3E:
+                # Additional status 3 repeats at the telemetry cadence, including
+                # on menu screens. Log transitions once to show what the PM saw.
+                if len(payload) >= 6:
+                    status = (payload[0], u16_le(payload, 2), u16_le(payload, 4))
+                    if status != self._last_screen_status:
+                        self._last_screen_status = status
+                        _LOGGER.debug(
+                            "PM5 operational state %d, screen %d, error %d (%s)",
+                            *status,
+                            self.address,
+                        )
             case _:
                 _LOGGER.debug(
                     "Received unhandled multiplex command (%s): %s -> %s",
@@ -1074,8 +1134,6 @@ class PM5BleSession:
 
     # 0x0031 (19 bytes) Rowing general status
     def _handle_0031(self, _uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != 19:
             _LOGGER.debug("Received unexpected length 0x0031 notify: %s", b.hex())
@@ -1114,6 +1172,22 @@ class PM5BleSession:
         )
         drag_factor = b[18]
 
+        if self._workout_state_raw is None:
+            _LOGGER.debug(
+                "First PM5 general status (%s): %s, elapsed %.2fs, distance %.1fm",
+                self.address,
+                workout_state,
+                elapsed_time_s,
+                distance_m,
+            )
+        elif workout_state_raw != self._workout_state_raw:
+            _LOGGER.debug(
+                "PM5 workout state changed (%s): %s, elapsed %.2fs, distance %.1fm",
+                self.address,
+                workout_state,
+                elapsed_time_s,
+                distance_m,
+            )
         # Track workout state for terminate gating
         self._workout_state_raw = workout_state_raw
 
@@ -1147,8 +1221,6 @@ class PM5BleSession:
 
     # 0x0032 Rowing additional status 1
     def _handle_0032(self, uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         multiplexed = uuid == self._uuid80
         base_size = 18 if multiplexed else 16
@@ -1188,8 +1260,6 @@ class PM5BleSession:
 
     # 0x0033 (18-20 bytes) Rowing additional status 2
     def _handle_0033(self, uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != (18 if uuid == self._uuid80 else 20):
             _LOGGER.debug("Received unexpected length 0x0033 notify: %s", b.hex())
@@ -1232,8 +1302,6 @@ class PM5BleSession:
 
     # 0x0035 (18-20 bytes) Stroke data
     def _handle_0035(self, uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != (18 if uuid == self._uuid80 else 20):
             _LOGGER.debug("Received unexpected length 0x0035 notify: %s", b.hex())
@@ -1273,8 +1341,6 @@ class PM5BleSession:
 
     # 0x0036 (15-17 bytes) Stroke data
     def _handle_0036(self, uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != (17 if uuid == self._uuid80 else 15):
             _LOGGER.debug("Received unexpected length 0x0036 notify: %s", b.hex())
@@ -1314,8 +1380,6 @@ class PM5BleSession:
 
     # 0x0037 (18 bytes) Split/interval data
     def _handle_0037(self, _uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != 18:
             _LOGGER.debug("Received unexpected length 0x0037 notify: %s", b.hex())
@@ -1350,8 +1414,6 @@ class PM5BleSession:
 
     # 0x0038 (18-19 bytes) Split/interval data
     def _handle_0038(self, _uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) not in (18, 19):
             _LOGGER.debug("Received unexpected length 0x0038 notify: %s", b.hex())
@@ -1392,8 +1454,6 @@ class PM5BleSession:
 
     # 0x0039 (18-20 bytes) End-of-workout summary
     def _handle_0039(self, uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != (18 if uuid == self._uuid80 else 20):
             _LOGGER.debug("Received unexpected length 0x0039 notify: %s", b.hex())
@@ -1436,8 +1496,6 @@ class PM5BleSession:
 
     # 0x003A (18-19 bytes) End-of-workout additional summary
     def _handle_003A(self, uuid: str, data: bytearray) -> None:
-        self._bump_seen()
-
         b = bytes(data)
         if len(b) != (18 if uuid == self._uuid80 else 19):
             _LOGGER.debug("Received unexpected length 0x003A notify: %s", b.hex())

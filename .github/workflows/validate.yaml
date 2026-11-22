@@ -75,6 +75,7 @@ jobs:
                   assert await async_setup(hass, {})
                   assert frontend.async_panel_exists(hass, "concept2-pm5")
                   assert hass.services.has_service("c2_pm5", "upload_workout")
+                  assert hass.services.has_service("c2_pm5", "read_latest_stored_workout")
                   hass.http.async_register_static_paths.assert_awaited_once()
                   paths = hass.http.async_register_static_paths.await_args.args[0]
                   assert all(Path(path.path).is_file() for path in paths)

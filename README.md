@@ -74,6 +74,12 @@ If the device is not discovered automatically:
 
 The FIT activity includes rowing time, distance, pace, stroke rate, power, calories, and heart-rate samples when the PM5 reports them. It stores one lap for the full workout. Heart-rate gaps remain empty. Recordings are saved in Home Assistant and survive restarts.
 
+For newly registered entities, Home Assistant enables sensors for saved workout metrics by default. You can enable additional sensors such as battery level, drag factor, and interval diagnostics from the PM5 device page. Workout recording uses Bluetooth data directly and works with any sensor selection.
+
+If Home Assistant receives only the finish, it saves the PM5's final totals and available averages as **Partial recording · PM5 summary only**.
+
+If Home Assistant missed even the finish, leave the PM5 idle when it next connects. The integration checks the latest workout in PM5 Memory and can recover a **Just Row** summary with its logged time, duration, and distance. Reconnect before finishing another workout, since the check reads only the newest entry. A missed row appears in the workout review list as **Recovered from PM5 Memory · Summary only**. If the row already has a recording, the integration keeps its live samples and Garmin review decision.
+
 ### Default Garmin account and phone approval
 
 1. Open **Settings → Devices & services → Concept2 PM5 → Configure** for your monitor.
@@ -81,6 +87,16 @@ The FIT activity includes rowing time, distance, pace, stroke rate, power, calor
 3. When a row is saved, the phone shows the duration and distance. Choose **Upload to Garmin** to send it to the configured account or **Keep locally** to skip the upload and retain the FIT download. The sidebar preselects the default account and lets you choose another for an individual row.
 
 Pending rows are eligible for notification when you enable phone review and after a Home Assistant restart. If an upload result is uncertain, open the workout in Home Assistant and check Garmin before explicitly retrying.
+
+### Inspect the latest workout in PM5 Memory
+
+The integration includes a manual, read-only diagnostic action for administrators. It uses the monitor's existing Bluetooth connection, including a Home Assistant Bluetooth proxy.
+
+1. Wake the PM5 and wait for **Connected** with the monitor idle.
+2. Open **Developer tools → Actions**, select **Concept2 PM5: Read latest stored workout** (`c2_pm5.read_latest_stored_workout`), and choose your monitor.
+3. Run the action. The response includes the record's start address, byte length, and hexadecimal contents. To check the result against the PM5 display, follow the [record comparison guide](tools/README.md).
+
+The diagnostic action returns the raw bytes for inspection. If you previously installed the standalone development probe, remove its `pm5_memory_probe:` configuration and component directory when you update.
 
 ---
 
@@ -109,6 +125,8 @@ After finishing your session, it's best to manually disable the App Connection o
 ---
 
 ## Automatic Idle Handling
+
+The idle disconnect timeout defaults to **5 minutes**. To change it, go to **Settings → Devices & services → Devices**, open your PM5, and set **Idle disconnect timeout** under **Configuration**. Each monitor has its own setting, from 1 to 60 minutes.
 
 If a workout is left running and the machine becomes idle:
 

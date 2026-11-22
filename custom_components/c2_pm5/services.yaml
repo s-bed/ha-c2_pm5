@@ -65,6 +65,17 @@ upload_workout:
           min: 1
           mode: box
 
+read_latest_stored_workout:
+  name: Read latest stored workout
+  description: Return the raw record for the most recent workout stored on a connected, idle PM5.
+  fields:
+    config_entry_id:
+      name: PM5 monitor
+      required: true
+      selector:
+        config_entry:
+          integration: c2_pm5
+
 keep_workout:
   name: Keep workout locally
   description: Decline Garmin upload and retain the workout and its FIT download in Home Assistant.

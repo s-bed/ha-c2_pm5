@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 from asyncio import AbstractEventLoop, TimerHandle
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
+import logging
+from math import isfinite
 from statistics import mean
+from typing import TYPE_CHECKING
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
+from .const import WORKOUT_TYPE
+
+if TYPE_CHECKING:
+    from .memory_record import StoredWorkout
+
+_LOGGER = logging.getLogger(__name__)
 _ACTIVE_STATES = range(1, 10)
 _FINISHED_STATES = (10, 11, 12)
 _RESET_STATES = (0, 13)
 _SAMPLE_GAP_SECONDS = 5
 _SUMMARY_GRACE_SECONDS = 4
 _RECONNECT_GRACE_SECONDS = 90
+_DISTANCE_TOLERANCE_M = 2
+# Leave headroom above rowing speeds when status packets were lost before the finish.
+_MAX_DISTANCE_PER_MISSING_SECOND = 15
 
 _STATUS_FIELDS = {
     "0032": {
@@ -55,6 +70,43 @@ def _log_key(values: dict, prefix: str) -> tuple[int, int]:
     return values[f"{prefix}_log_entry_date"], values[f"{prefix}_log_entry_time"]
 
 
+def summary_identity(
+    address: str, date: int, time: int, elapsed: float, distance: float
+) -> tuple[str, int, int, int, int]:
+    """Identify a PM5 result at the precision of its on-wire totals."""
+    return address.upper(), date, time, round(elapsed * 100), round(distance * 10)
+
+
+def matches_memory_totals(
+    elapsed: float, distance: float, other_elapsed: float, other_distance: float
+) -> bool:
+    """Compare BLE totals to the tenths of seconds and whole meters in memory."""
+    return (
+        abs(round(elapsed * 100) - round(other_elapsed * 100)) < 10
+        and abs(round(distance * 10) - round(other_distance * 10)) < 10
+    )
+
+
+def compatible_memory_workout_type(workout_type: str | None) -> bool:
+    """The supported memory layout is Just Row; older tracks can lack a type."""
+    return workout_type in (None, "Just Row", WORKOUT_TYPE[0], WORKOUT_TYPE[1])
+
+
+def _recent_end_minute(key: tuple[int, int], now: float, zone: ZoneInfo) -> int | None:
+    """Match the receipt minute, the two replay minutes, or a rounded-up PM clock."""
+    current_minute = int(now) // 60 * 60
+    # The PM clock is set to the nearest minute and can run 30 seconds ahead.
+    latest_minute = int(now + 30) // 60 * 60
+    oldest_minute = current_minute - 120
+    for end in range(latest_minute, oldest_minute - 1, -60):
+        # Checking real UTC minutes also selects the right fold at a DST change.
+        local = datetime.fromtimestamp(end, zone)
+        date = ((local.year - 2000) << 9) | (local.day << 4) | local.month
+        if key == (date, (local.hour << 8) | local.minute):
+            return end
+    return None
+
+
 @dataclass
 class _Recording:
     start_time: float
@@ -63,7 +115,8 @@ class _Recording:
     partial: bool = False
     finished: bool = False
     summary_key: tuple[int, int] | None = None
-    additional_summary: tuple[tuple[int, int], dict] | None = None
+    summary_only: bool = False
+    additional_summary: dict | None = None
     metadata: dict = field(default_factory=dict)
     samples: dict[int, dict] = field(default_factory=dict)
 
@@ -82,15 +135,23 @@ class WorkoutRecorder:
         address: str,
         name: str,
         on_complete: Callable[[dict], None],
+        time_zone: str = "UTC",
+        *,
+        has_saved_summary: Callable[[str, int, int, float, float], bool] | None = None,
     ) -> None:
         self._loop = loop
         self._address = address
         self._name = name
         self._on_complete = on_complete
+        self._zone = ZoneInfo(time_zone)
+        self._has_saved_summary = has_saved_summary
         self._workout: _Recording | None = None
+        self._recovered: _Recording | None = None
+        self._recovery_timer: TimerHandle | None = None
         self._finish_timer: TimerHandle | None = None
         self._disconnect_timer: TimerHandle | None = None
-        self._last_summary_key: tuple[int, int] | None = None
+        self._recent_summaries: deque[tuple[str, int, int, int, int]] = deque(maxlen=16)
+        self._pending_additional: tuple[tuple[int, int], float, dict] | None = None
         self._closed = False
 
     @property
@@ -112,20 +173,59 @@ class WorkoutRecorder:
             self._general_status(values, now)
             return
 
-        workout = self._workout
-        if workout is None:
-            return
         if "0039_log_entry_date" in values:
-            self._summary(workout, values)
+            self._summary(values, now)
         elif "003a_log_entry_date" in values:
-            key = _log_key(values, "003a")
-            if key != self._last_summary_key:
-                fields = _metrics(values, _ADDITIONAL_SUMMARY_FIELDS)
-                workout.additional_summary = (key, fields)
-                if key == workout.summary_key:
-                    workout.metadata.update(fields)
-        else:
-            self._live_metrics(workout, values)
+            self._additional(values, now)
+        elif self._workout:
+            self._live_metrics(self._workout, values)
+
+    def recover_memory(self, stored: StoredWorkout, now: float) -> None:
+        """Submit a historical PM5 result using the monitor's local end minute."""
+        if self._closed or self.recording:
+            return
+        local = stored.pm_time
+        # Round-trip through UTC to reject skipped local times. A historical
+        # record during the repeated hour has no offset to identify its fold.
+        ends = set()
+        for fold in (0, 1):
+            end = int(local.replace(tzinfo=self._zone, fold=fold).timestamp())
+            round_trip = datetime.fromtimestamp(end, self._zone).replace(tzinfo=None)
+            if end <= now + 30 and round_trip == local:
+                ends.add(end)
+        if len(ends) != 1:
+            _LOGGER.debug("Ignoring ambiguous or invalid PM5 memory time %s", local)
+            return
+        end = ends.pop()
+        date = ((local.year - 2000) << 9) | (local.day << 4) | local.month
+        time = (local.hour << 8) | local.minute
+        # A live finish can still be awaiting additional metrics. Let the
+        # normal recording path save it with its full precision.
+        if any(
+            compatible_memory_workout_type(row.metadata.get("workout_type"))
+            and matches_memory_totals(stored.duration_s, stored.distance_m, row.elapsed, row.distance)
+            for row in self._pending_for_minute((date, time))
+        ):
+            return
+        recovered = _Recording(
+            min(end, now) - stored.duration_s,
+            elapsed=stored.duration_s,
+            distance=stored.distance_m,
+            partial=True,
+            finished=True,
+            summary_only=True,
+            metadata={
+                "pm5_log_date": date,
+                "pm5_log_time": time,
+                "pm5_end_minute": end,
+                "summary_source": "memory",
+                "workout_type": stored.workout_type,
+                "pm5_memory_address": stored.record_address,
+            },
+        )
+        # Keep the memory result out of the live-summary replay cache. A later
+        # 0x39 packet can still supply precise totals and measured averages.
+        self._emit(recovered)
 
     def _general_status(self, values: dict, now: float) -> None:
         state = values["0031_workout_state_raw"]
@@ -137,6 +237,12 @@ class WorkoutRecorder:
             if workout and (
                 self._finish_timer is not None or elapsed + 1 < workout.elapsed
             ):
+                if (
+                    workout.summary_key is not None
+                    and abs(elapsed - workout.elapsed) < 0.01
+                    and abs(distance - workout.distance) < 0.1
+                ):
+                    return
                 self.finish()
                 workout = None
             if workout is None:
@@ -146,6 +252,10 @@ class WorkoutRecorder:
                     now - elapsed, partial=elapsed > _SAMPLE_GAP_SECONDS
                 )
                 workout.metadata["workout_type"] = values.get("0031_workout_type")
+                _LOGGER.info(
+                    "PM5 recording started (%s): first active status %.2f s, %.1f m",
+                    self._address, elapsed, distance,
+                )
         elif workout is None:
             return
         elif state in _RESET_STATES:
@@ -185,33 +295,145 @@ class WorkoutRecorder:
             if workout.summary_key is None:
                 workout.metadata.update(_metrics(values, _LIVE_AVERAGES))
 
-    def _summary(self, workout: _Recording, values: dict) -> None:
+    def _recent_additional(self, key: tuple[int, int], now: float) -> dict | None:
+        pending = self._pending_additional
+        if (
+            pending and pending[0] == key
+            and 0 <= now - pending[1] <= _SUMMARY_GRACE_SECONDS
+        ):
+            return pending[2]
+        return None
+
+    def _pending_for_minute(self, key: tuple[int, int]) -> list[_Recording]:
+        return [
+            row for row in (self._workout, self._recovered)
+            if row is not None and row.summary_key == key
+        ]
+
+    def _finalized_in_minute(self, key: tuple[int, int]) -> bool:
+        return any(identity[1:3] == key for identity in self._recent_summaries)
+
+    def _additional(self, values: dict, now: float) -> None:
+        key = _log_key(values, "003a")
+        # Additional packets lack totals. Two rows ending in the same minute
+        # cannot be distinguished using this packet alone.
+        candidates = self._pending_for_minute(key)
+        if len(candidates) > 1 or self._finalized_in_minute(key):
+            return
+        fields = _metrics(values, _ADDITIONAL_SUMMARY_FIELDS)
+        previous = (
+            candidates[0].additional_summary
+            if candidates else self._recent_additional(key, now)
+        )
+        if previous is not None and previous != fields:
+            fields = {}
+        if candidates:
+            candidates[0].additional_summary = fields
+        else:
+            self._pending_additional = key, now, fields
+
+    def _matches_live(
+        self, workout: _Recording, elapsed: float, distance: float, now: float,
+        end_minute: int | None,
+    ) -> bool:
+        elapsed_gap = elapsed - workout.elapsed
+        distance_gap = distance - workout.distance
+        if elapsed_gap < -2 or distance_gap < -_DISTANCE_TOLERANCE_M:
+            return False
+        if elapsed > now - workout.start_time + 2:
+            return False
+        if (
+            elapsed_gap > 2 * _SAMPLE_GAP_SECONDS
+            and not (workout.finished or self._disconnect_timer)
+        ):
+            return False
+        if end_minute is not None and end_minute + 60 < workout.start_time + elapsed - 2:
+            # The PM's clock can drift. Strong agreement on both live counters
+            # can still identify a finish even if the reported minute is early.
+            return abs(elapsed_gap) <= 2 and abs(distance_gap) <= _DISTANCE_TOLERANCE_M
+        max_distance_gain = max(0, elapsed_gap) * _MAX_DISTANCE_PER_MISSING_SECOND
+        return distance_gap <= _DISTANCE_TOLERANCE_M + max_distance_gain
+
+    def _summary(self, values: dict, now: float) -> None:
         key = _log_key(values, "0039")
         elapsed = values["0039_elapsed_time_s"]
         distance = values["0039_distance_m"]
-        if elapsed <= 0 or distance <= 0:
-            return
-        if key == self._last_summary_key or (
-            workout.summary_key is not None and workout.summary_key != key
+        if not (
+            isfinite(elapsed) and elapsed > 0 and isfinite(distance) and distance > 0
         ):
             return
-        if elapsed + 2 < workout.elapsed or (
-            elapsed > workout.elapsed + 2 * _SAMPLE_GAP_SECONDS
-            and not (workout.finished or self._disconnect_timer)
+        identity = summary_identity(self._address, *key, elapsed, distance)
+        candidates = self._pending_for_minute(key)
+        if any(
+            identity == summary_identity(self._address, *key, row.elapsed, row.distance)
+            for row in candidates
         ):
             return
+        if identity in self._recent_summaries:
+            return
+        if self._has_saved_summary and self._has_saved_summary(
+            self._address, *key, elapsed, distance
+        ):
+            self._recent_summaries.append(identity)
+            if self._pending_additional and self._pending_additional[0] == key:
+                self._pending_additional = None
+            for row in candidates:
+                row.additional_summary = None
+            return
+        workout = self._workout
+        end = _recent_end_minute(key, now, self._zone)
+        if (
+            workout is None or workout.summary_key is not None
+            or not self._matches_live(workout, elapsed, distance, now, end)
+        ):
+            if end is None:
+                _LOGGER.debug(
+                    "Ignoring stale or invalid standalone PM5 summary (%s)", self._address
+                )
+                return
+            for row in candidates:
+                row.additional_summary = None
+            self._finish_recovered()
+            # The PM reports whole minutes. Cap the estimated end at receipt
+            # even when its rounded clock already shows the next minute.
+            workout = self._recovered = _Recording(
+                min(now, end + 59) - elapsed, partial=True, summary_only=True
+            )
+            workout.metadata.update(
+                pm5_end_minute=end, workout_type=values.get("0039_workout_type")
+            )
+            _LOGGER.info(
+                "PM5 recovered end summary (%s): %.2f s, %.1f m",
+                self._address, elapsed, distance,
+            )
+            self._recovery_timer = self._loop.call_later(
+                _SUMMARY_GRACE_SECONDS, self._finish_recovered
+            )
+        else:
+            for row in candidates:
+                row.additional_summary = None
+            self._clear_disconnect_timer()
+            self._schedule_finish()
         if elapsed - workout.elapsed > _SAMPLE_GAP_SECONDS:
             workout.partial = True
         workout.elapsed = elapsed
         workout.distance = distance
-        workout.sample(elapsed)["distance_m"] = distance
+        if not workout.summary_only:
+            workout.sample(elapsed)["distance_m"] = distance
         workout.finished = True
         workout.summary_key = key
         workout.metadata.update(_metrics(values, _SUMMARY_FIELDS))
-        if workout.additional_summary and workout.additional_summary[0] == key:
-            workout.metadata.update(workout.additional_summary[1])
-        self._clear_disconnect_timer()
-        self._schedule_finish()
+        if not candidates and not self._finalized_in_minute(key):
+            workout.additional_summary = self._recent_additional(key, now)
+        self._pending_additional = None
+
+    def _finish_recovered(self) -> None:
+        if self._recovery_timer is not None:
+            self._recovery_timer.cancel()
+            self._recovery_timer = None
+        recovered, self._recovered = self._recovered, None
+        if recovered:
+            self._emit(recovered)
 
     def _schedule_finish(self) -> None:
         if self._finish_timer is None:
@@ -231,10 +453,22 @@ class WorkoutRecorder:
             self._finish_timer.cancel()
             self._finish_timer = None
         workout, self._workout = self._workout, None
-        if workout is None or workout.elapsed < 1 or workout.distance <= 0:
-            return
+        if workout and workout.elapsed >= 1 and workout.distance > 0:
+            self._emit(workout)
+
+    def _emit(self, workout: _Recording) -> None:
         if workout.summary_key is not None:
-            self._last_summary_key = workout.summary_key
+            date, time = workout.summary_key
+            self._recent_summaries.append(
+                summary_identity(
+                    self._address, date, time, workout.elapsed, workout.distance
+                )
+            )
+            workout.metadata.update(pm5_log_date=date, pm5_log_time=time)
+            if workout.additional_summary:
+                workout.metadata.update(workout.additional_summary)
+        if workout.summary_only:
+            workout.metadata["summary_only"] = True
         samples = [
             {"timestamp": workout.start_time + second, **sample}
             for second, sample in sorted(workout.samples.items())
@@ -253,6 +487,12 @@ class WorkoutRecorder:
                 ]
                 if observed:
                     workout.metadata[field_name] = aggregate(observed)
+        if workout.metadata.get("summary_source") != "memory":
+            _LOGGER.info(
+                "PM5 recording finalized (%s): %.2f s, %.1f m, %d samples, partial=%s",
+                self._address, workout.elapsed, workout.distance, len(samples),
+                workout.partial or not workout.finished,
+            )
         self._on_complete(
             {
                 "workout_id": str(uuid4()),
@@ -274,3 +514,4 @@ class WorkoutRecorder:
         """Save the final captured portion and ignore any further packets."""
         self._closed = True
         self.finish()
+        self._finish_recovered()
