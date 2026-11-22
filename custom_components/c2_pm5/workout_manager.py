@@ -22,15 +22,64 @@ from .garmin_upload import (
     garmin_account,
     garmin_account_ready,
 )
+from .workout_recorder import summary_identity
 
 _LOGGER = logging.getLogger(__name__)
 _UNCERTAIN = "The upload outcome is uncertain. Check Garmin before retrying."
 REVIEW_STATUSES = frozenset({"ready", "needs_review"})
 _RESOLVED_STATUSES = ("uploaded", "kept_local")
+_REVIEW_FIELDS = {"status", "error", "upload_attempt", "garmin_entity_id"}
 
 
 class WorkoutError(Exception):
     """A workout could not be read or its upload could not be authorized."""
+
+
+def _summary_identity(workout: dict) -> tuple | None:
+    if workout.get("pm5_log_date") is None or workout.get("pm5_log_time") is None:
+        return None
+    return summary_identity(
+        workout["address"],
+        workout["pm5_log_date"],
+        workout["pm5_log_time"],
+        workout["elapsed_seconds"],
+        workout["distance_m"],
+    )
+
+
+def _matches_capture(capture: dict, summary: dict) -> bool:
+    """Correlate a fresh finish with a recording saved before its summary arrived."""
+    if (
+        capture["address"].upper() != summary["address"].upper()
+        or "pm5_log_date" in capture
+    ):
+        return False
+    # The PM clock is set to the nearest minute. Allow for that rounding when
+    # comparing its finish minute with wall-clock timestamps from live packets.
+    # A rounded-up PM minute can fall after the summary's estimated end time.
+    # Older recordings only stored the estimated end.
+    minute = summary.get("pm5_end_minute", int(summary["end_time"]) // 60 * 60)
+    earliest_end, latest_end = minute - 30, minute + 90
+    if (
+        round(capture["elapsed_seconds"] * 100) == round(summary["elapsed_seconds"] * 100)
+        and round(capture["distance_m"] * 10) == round(summary["distance_m"] * 10)
+    ):
+        return earliest_end <= capture["end_time"] <= latest_end
+    if (
+        not capture["partial"]
+        or capture["elapsed_seconds"] > summary["elapsed_seconds"]
+        or capture["distance_m"] > summary["distance_m"]
+    ):
+        return False
+    # For a truncated capture require its observed track to overlap *every*
+    # possible placement of the row in the PM's minute. Two consecutive short
+    # workouts in that minute would otherwise look like the same activity.
+    duration = summary["elapsed_seconds"]
+    return (
+        earliest_end <= capture["start_time"] + duration <= latest_end
+        and capture["end_time"] > latest_end - duration
+        and capture["start_time"] < earliest_end
+    )
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -56,6 +105,7 @@ class WorkoutManager:
         self._directory = Path(hass.config.path(".storage", f"{DOMAIN}_workouts"))
         self._workouts: dict[str, dict] = {}
         self._unsaved: dict[str, dict] = {}
+        self._summary_keys: set[tuple] = set()
         self._lock = asyncio.Lock()
         self.last_error: str | None = None
 
@@ -63,6 +113,11 @@ class WorkoutManager:
         self._workouts, self.last_error = await self.hass.async_add_executor_job(
             self._load_summaries
         )
+        self._summary_keys = {
+            key
+            for workout in self._workouts.values()
+            if (key := _summary_identity(workout)) is not None
+        }
 
     def _load_summaries(self) -> tuple[dict[str, dict], str | None]:
         workouts = {}
@@ -141,10 +196,61 @@ class WorkoutManager:
             )
         ]
 
+    def has_saved_summary(
+        self, address: str, date: int, time: int, elapsed: float, distance: float
+    ) -> bool:
+        """Include pending saves so a repeated packet cannot queue a second row."""
+        key = summary_identity(address, date, time, elapsed, distance)
+        return key in self._summary_keys
+
+    def _match_unpaired_recording(self, workout: dict) -> dict:
+        """Join a finish and its independently finalized live track, in either order."""
+        recordings = self._workouts | self._unsaved
+        if workout.get("summary_only"):
+            matches = [row for row in recordings.values() if _matches_capture(row, workout)]
+        else:
+            matches = [
+                row for row in recordings.values()
+                if row.get("summary_only") and _matches_capture(workout, row)
+            ]
+        if len(matches) != 1:
+            return workout
+        previous = matches[0]
+        if workout.get("summary_only"):
+            capture, summary = previous, workout
+        else:
+            capture, summary = workout, previous
+        merged = dict(capture)
+        merged.update((key, value) for key, value in summary.items() if value is not None)
+        for key in _REVIEW_FIELDS:
+            merged.pop(key, None)
+        merged.update(
+            workout_id=previous["workout_id"],
+            start_time=capture["start_time"],
+            end_time=capture["start_time"] + summary["elapsed_seconds"],
+            partial=capture["partial"],
+            summary_only=False,
+            sample_count=capture.get("sample_count", 0),
+            heart_rate_sample_count=capture.get("heart_rate_sample_count", 0),
+            # A saved header has no samples. Read its track during the atomic write.
+            samples=capture.get("samples"),
+        )
+        return merged
+
     def record(self, workout: dict) -> None:
         """Queue a new recording for an immediate private write."""
+        if workout["workout_id"] in self._workouts or workout["workout_id"] in self._unsaved:
+            return
+        key = _summary_identity(workout)
+        if key is not None:
+            if key in self._summary_keys:
+                _LOGGER.debug("Ignored repeated PM5 finish summary for %s", workout["address"])
+                return
+            self._summary_keys.add(key)
+        if key is None or workout.get("summary_only"):
+            workout = self._match_unpaired_recording(workout)
         workout_id = workout["workout_id"]
-        self._unsaved[workout_id] = dict(workout, time_zone=self.hass.config.time_zone)
+        self._unsaved[workout_id] = {"time_zone": self.hass.config.time_zone, **workout}
         self.hass.async_create_task(
             self.async_flush(), f"Save PM5 workout {workout_id}"
         )
@@ -152,35 +258,41 @@ class WorkoutManager:
     async def async_flush(self) -> None:
         async with self._lock:
             for workout_id, workout in list(self._unsaved.items()):
-                if workout_id not in self._workouts:
-                    summary = {
-                        key: value for key, value in workout.items() if key != "samples"
-                    }
-                    try:
-                        await self.hass.async_add_executor_job(
-                            self._write_recording,
-                            workout_id,
-                            summary,
-                            workout["samples"],
-                        )
-                    except (OSError, ValueError):
-                        _LOGGER.exception("Could not save PM5 workout %s", workout_id)
-                        continue
+                summary = {
+                    key: value for key, value in workout.items() if key != "samples"
+                }
+                try:
+                    await self.hass.async_add_executor_job(
+                        self._write_recording, workout_id, summary, workout["samples"]
+                    )
+                except (OSError, ValueError):
+                    _LOGGER.exception("Could not save PM5 workout %s", workout_id)
+                    continue
+                if workout_id in self._workouts:
+                    self._workouts[workout_id].update(summary)
+                else:
                     self._workouts[workout_id] = dict(
                         summary, status="ready", error=None, upload_attempt=0
                     )
                     async_dispatcher_send(self.hass, SIGNAL_WORKOUT_UPDATED, workout_id)
-                del self._unsaved[workout_id]
+                _LOGGER.debug(
+                    "Saved PM5 workout %s (%s), %.2f s, %.1f m",
+                    workout_id, workout["address"], workout["elapsed_seconds"], workout["distance_m"],
+                )
+                if self._unsaved[workout_id] is workout:
+                    del self._unsaved[workout_id]
             if self._unsaved:
                 self.last_error = "A completed workout could not be saved."
             elif self.last_error == "A completed workout could not be saved.":
                 self.last_error = None
 
     def _write_recording(
-        self, workout_id: str, summary: dict, samples: list[dict]
+        self, workout_id: str, summary: dict, samples: list[dict] | None
     ) -> None:
         # Read only the first line when loading the history at startup.
         header = json.dumps(summary, separators=(",", ":"), allow_nan=False)
+        if samples is None:
+            samples = self._read_samples(workout_id)
         track = json.dumps(samples, separators=(",", ":"), allow_nan=False)
         _atomic_write(
             self._directory / f"{workout_id}.jsonl", f"{header}\n{track}\n".encode()

@@ -105,6 +105,9 @@ def encode_workout(workout: dict, time_zone: str) -> bytes:
         fields = _record_fields(sample)
         if start <= timestamp <= end and fields:
             records_by_time.setdefault(timestamp, {}).update(fields)
+    if workout.get("pm5_log_date") is not None:
+        # The PM measured the final distance even if we missed the live stream.
+        records_by_time.setdefault(end, {})["distance"] = distance
     if not records_by_time:
         raise ValueError("Workout has no recorded measurements in its time range.")
 

@@ -361,7 +361,8 @@ class Concept2Panel extends HTMLElement {
     );
     panel.replaceChildren(title, monitor, metrics);
     if (workout.partial) {
-      panel.append(element("p", "Partial recording", "notice muted"));
+      const label = workout.summary_only ? "Partial recording · PM5 summary only" : "Partial recording";
+      panel.append(element("p", label, "notice muted"));
     }
     const heartRateSamples = workout.heart_rate_sample_count || 0;
     const sampleCount = workout.sample_count || 0;
