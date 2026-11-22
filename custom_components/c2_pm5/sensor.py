@@ -704,9 +704,4 @@ class PM5Sensor(RestoreSensor):
 
     @property
     def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, self.coordinator.address)},
-            name=self.coordinator.device_type,
-            manufacturer="Concept2",
-            model="PM5",
-        )
+        return self.coordinator.device_info

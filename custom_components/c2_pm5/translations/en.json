@@ -18,6 +18,13 @@
         }
     }
   },
+  "entity": {
+    "number": {
+      "idle_disconnect_minutes": {
+        "name": "Idle disconnect timeout"
+      }
+    }
+  },
   "options": {
     "step": {
       "init": {

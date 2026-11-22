@@ -124,6 +124,8 @@ After finishing your session, it's best to manually disable the App Connection o
 
 ## Automatic Idle Handling
 
+The idle disconnect timeout defaults to **5 minutes**. To change it, go to **Settings → Devices & services → Devices**, open your PM5, and set **Idle disconnect timeout** under **Configuration**. Each monitor has its own setting, from 1 to 60 minutes.
+
 If a workout is left running and the machine becomes idle:
 
 - The integration detects prolonged inactivity

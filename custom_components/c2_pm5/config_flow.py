@@ -21,6 +21,7 @@ from .const import (
     CONF_ADDRESS,
     CONF_DEVICE_TYPE,
     CONF_GARMIN_ACCOUNT,
+    CONF_IDLE_DISCONNECT_MINUTES,
     CONF_NOTIFICATION_DEVICE,
     DEVICE_TYPES,
 )
@@ -137,6 +138,10 @@ class WorkoutOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
         if user_input is not None:
             options = dict(user_input)
+            if CONF_IDLE_DISCONNECT_MINUTES in self.config_entry.options:
+                options[CONF_IDLE_DISCONNECT_MINUTES] = self.config_entry.options[
+                    CONF_IDLE_DISCONNECT_MINUTES
+                ]
             if options.get(CONF_GARMIN_ACCOUNT) == _NO_ACCOUNT:
                 options.pop(CONF_GARMIN_ACCOUNT)
             return self.async_create_entry(data=options)

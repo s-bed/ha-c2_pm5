@@ -18,8 +18,9 @@ from bleak_retry_connector import (
     BleakConnectionError,
 )
 
-from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback
 from homeassistant.components import bluetooth
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -37,6 +38,7 @@ from .const import (
     CHAR_0080,
     CHAR_CSAFE_RX,
     CHAR_CSAFE_TX,
+    CONF_IDLE_DISCONNECT_MINUTES,
     CSAFE_COMMAND_WRAPPER_NONE,
     CSAFE_COMMAND_WRAPPER_GETPMCFG,
     CSAFE_COMMAND_WRAPPER_GETPMDATA,
@@ -55,12 +57,12 @@ from .const import (
     DATETIME_SYNC_CONNECT_GRACE_SECONDS,
     DATETIME_SYNC_RATE_LIMIT_SECONDS,
     DATETIME_SYNC_TIMEOUT_SECONDS,
+    DEFAULT_IDLE_DISCONNECT_MINUTES,
     DEVICE_STALE_SECONDS,
     ERG_MACHINE_TYPE,
     HRM_DEVICE_TYPE,
     HRM_POLL_SECONDS,
     IDLE_DISCONNECT_COOLDOWN_SECONDS,
-    IDLE_DISCONNECT_SECONDS,
     INTERVAL_TYPE,
     ROWING_STATE,
     STROKE_STATE,
@@ -216,9 +218,12 @@ class PM5BleSession:
         address: str,
         on_data: Callable[[PM5Data], None],
         on_available: Callable[[bool], None],
+        *,
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         self.hass = hass
         self.address = address.upper()
+        self._config_entry = config_entry
         self.on_data = on_data
         self.on_available = on_available
 
@@ -816,6 +821,14 @@ class PM5BleSession:
             _LOGGER.debug("Poll loop crashed (%s): %s", self.address, err)
 
     # ---------- Idle watchdog ----------
+    @property
+    def idle_disconnect_minutes(self) -> int:
+        if self._config_entry is None:
+            return DEFAULT_IDLE_DISCONNECT_MINUTES
+        return self._config_entry.options.get(
+            CONF_IDLE_DISCONNECT_MINUTES, DEFAULT_IDLE_DISCONNECT_MINUTES
+        )
+
     async def _idle_watchdog(self, idle_event: asyncio.Event) -> None:
         try:
             while not self._stop.is_set():
@@ -825,10 +838,15 @@ class PM5BleSession:
                 if last_active is None:
                     continue
 
-                idle_for = time.monotonic() - last_active
-                if idle_for < IDLE_DISCONNECT_SECONDS:
+                idle_minutes = self.idle_disconnect_minutes
+                if time.monotonic() - last_active < idle_minutes * 60:
                     continue
 
+                _LOGGER.warning(
+                    "PM5 idle for %d minutes; disconnecting to allow sleep (%s)",
+                    idle_minutes,
+                    self.address,
+                )
                 idle_event.set()
                 return
         except asyncio.CancelledError:
@@ -974,12 +992,6 @@ class PM5BleSession:
             await asyncio.gather(*pending, return_exceptions=True)
 
             if idle_disconnect.is_set() and not self._stop.is_set():
-                _LOGGER.warning(
-                    "PM5 idle for %d minutes; disconnecting to allow sleep (%s)",
-                    IDLE_DISCONNECT_SECONDS // 60,
-                    self.address,
-                )
-
                 try:
                     terminated = has_csafe_rx and await self._terminate_workout()
                 except Exception:

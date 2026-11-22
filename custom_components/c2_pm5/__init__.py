@@ -10,6 +10,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
@@ -90,7 +91,21 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
         self.async_set_updated_data(self.state)
 
         self.session = PM5BleSession(
-            hass, device_type, address, self._handle_data, self._handle_available
+            hass,
+            device_type,
+            address,
+            self._handle_data,
+            self._handle_available,
+            config_entry=entry,
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.address)},
+            name=self.device_type,
+            manufacturer="Concept2",
+            model="PM5",
         )
 
     def _handle_available(self, available: bool) -> None:
