@@ -4,6 +4,7 @@
 
 - Connect immediately when a configured PM5 reappears. Debug logs show the connection attempts, first workout status, recording start, and save.
 - Recover a partial row from a recent PM5 finish summary when Home Assistant missed the live strokes. Repeated summaries are recognized across restarts.
+- Check PM5 Memory when the monitor connects and becomes idle. Recover the latest supported Just Row summary even if Home Assistant missed the entire workout, and keep existing samples and review decisions when a matching row is already saved.
 - Inspect the latest stored workout on an idle monitor through the built-in administrator action `c2_pm5.read_latest_stored_workout`. The action returns the raw record for comparison with PM5 Memory.
 
 ## 2026.11.0

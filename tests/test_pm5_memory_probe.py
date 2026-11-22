@@ -228,17 +228,14 @@ class MemoryActionTests(IsolatedAsyncioTestCase):
             blocking=True, return_response=response, context=context,
         )
 
-    async def test_idle_monitor_reads_only_when_action_is_explicitly_called(self):
+    async def test_manual_action_returns_raw_bytes_even_for_an_unknown_layout(self):
         self.session._csafe_request = AsyncMock(side_effect=[
             bytes.fromhex("99060001244e0001"),
             bytes.fromhex("6a4101ab") + bytes(63),
             bytes.fromhex("99060001244e0001"),
         ])
-        self.session._set_connected(True)
-        self.session._handle_0031(self.session._uuid31, bytearray(19))
-        self.session._handle_0080(self.session._uuid80, bytearray([0x3F]) + bytearray(15))
-        await self.hass.async_block_till_done()
-        self.session._csafe_request.assert_not_awaited()
+        self.session._connected = True
+        self.session._workout_state_raw = 0
         response = await self.call()
         self.assertEqual(response, {"address": 0x1244E, "length": 1, "record_hex": "ab"})
         self.assertEqual(
@@ -246,6 +243,40 @@ class MemoryActionTests(IsolatedAsyncioTestCase):
             [0x99, 0x6A, 0x99],
         )
         self.assertEqual(self.hass.data[DOMAIN]["workout_manager"].list_workouts(), [])
+
+    async def test_idle_link_recovers_two_memory_blocks_into_local_review(self):
+        # Synthetic Just Row with no device identifiers. Nov 21, 2024 at
+        # 20:56 local time, 122.4 s, 159 m, one split.
+        record = bytearray(82)
+        record[:2] = bytes.fromhex("9501")
+        record[8:12] = bytes.fromhex("315b1438")
+        record[18:30] = bytes.fromhex("9600000004c80000009f0001")
+        descriptor = bytes.fromhex("9906000100000052")
+        self.session._csafe_request = AsyncMock(side_effect=[
+            descriptor,
+            bytes.fromhex("6a4140") + record[:64],
+            bytes.fromhex("6a4112") + record[64:] + bytes(46),
+            descriptor,
+        ])
+        self.session.supports_memory_reads = True
+        self.session._set_connected(True)
+        self.session._handle_0031(self.session._uuid31, bytearray(19))
+        await self.hass.async_block_till_done(wait_background_tasks=True)
+
+        reads = [call.args for call in self.session._csafe_request.await_args_list]
+        self.assertEqual(reads, [
+            (GET_CFG, 0x99, b""),
+            (GET_DATA, 0x6A, bytes.fromhex("0001000040")),
+            (GET_DATA, 0x6A, bytes.fromhex("0001004012")),
+            (GET_CFG, 0x99, b""),
+        ])
+        manager = self.hass.data[DOMAIN]["workout_manager"]
+        [row] = manager.list_workouts()
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual((row["elapsed_seconds"], row["distance_m"]), (122.4, 159))
+        self.assertEqual((row["pm5_log_date"], row["pm5_log_time"]), (0x315B, 0x1438))
+        self.assertTrue(row["summary_only"])
+        self.assertEqual((await manager.async_get_workout(row["workout_id"]))["samples"], [])
 
     async def test_response_admin_and_loaded_monitor_are_required(self):
         self.assertIs(
@@ -296,6 +327,7 @@ class MemoryActionTests(IsolatedAsyncioTestCase):
         for failure, message in (
             (TimeoutError(), "Timed out"),
             (BleakError("unsupported command"), "unsupported command"),
+            (OSError("adapter unavailable"), "adapter unavailable"),
         ):
             with self.subTest(failure=type(failure).__name__):
                 self.session._csafe_request = AsyncMock(side_effect=failure)

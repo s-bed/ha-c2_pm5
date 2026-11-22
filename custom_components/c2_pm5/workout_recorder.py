@@ -10,8 +10,14 @@ from datetime import datetime
 import logging
 from math import isfinite
 from statistics import mean
+from typing import TYPE_CHECKING
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+
+from .const import WORKOUT_TYPE
+
+if TYPE_CHECKING:
+    from .memory_record import StoredWorkout
 
 _LOGGER = logging.getLogger(__name__)
 _ACTIVE_STATES = range(1, 10)
@@ -69,6 +75,21 @@ def summary_identity(
 ) -> tuple[str, int, int, int, int]:
     """Identify a PM5 result at the precision of its on-wire totals."""
     return address.upper(), date, time, round(elapsed * 100), round(distance * 10)
+
+
+def matches_memory_totals(
+    elapsed: float, distance: float, other_elapsed: float, other_distance: float
+) -> bool:
+    """Compare BLE totals to the tenths of seconds and whole meters in memory."""
+    return (
+        abs(round(elapsed * 100) - round(other_elapsed * 100)) < 10
+        and abs(round(distance * 10) - round(other_distance * 10)) < 10
+    )
+
+
+def compatible_memory_workout_type(workout_type: str | None) -> bool:
+    """The supported memory layout is Just Row; older tracks can lack a type."""
+    return workout_type in (None, "Just Row", WORKOUT_TYPE[0], WORKOUT_TYPE[1])
 
 
 def _recent_end_minute(key: tuple[int, int], now: float, zone: ZoneInfo) -> int | None:
@@ -158,6 +179,53 @@ class WorkoutRecorder:
             self._additional(values, now)
         elif self._workout:
             self._live_metrics(self._workout, values)
+
+    def recover_memory(self, stored: StoredWorkout, now: float) -> None:
+        """Submit a historical PM5 result using the monitor's local end minute."""
+        if self._closed or self.recording:
+            return
+        local = stored.pm_time
+        # Round-trip through UTC to reject skipped local times. A historical
+        # record during the repeated hour has no offset to identify its fold.
+        ends = set()
+        for fold in (0, 1):
+            end = int(local.replace(tzinfo=self._zone, fold=fold).timestamp())
+            round_trip = datetime.fromtimestamp(end, self._zone).replace(tzinfo=None)
+            if end <= now + 30 and round_trip == local:
+                ends.add(end)
+        if len(ends) != 1:
+            _LOGGER.debug("Ignoring ambiguous or invalid PM5 memory time %s", local)
+            return
+        end = ends.pop()
+        date = ((local.year - 2000) << 9) | (local.day << 4) | local.month
+        time = (local.hour << 8) | local.minute
+        # A live finish can still be awaiting additional metrics. Let the
+        # normal recording path save it with its full precision.
+        if any(
+            compatible_memory_workout_type(row.metadata.get("workout_type"))
+            and matches_memory_totals(stored.duration_s, stored.distance_m, row.elapsed, row.distance)
+            for row in self._pending_for_minute((date, time))
+        ):
+            return
+        recovered = _Recording(
+            min(end, now) - stored.duration_s,
+            elapsed=stored.duration_s,
+            distance=stored.distance_m,
+            partial=True,
+            finished=True,
+            summary_only=True,
+            metadata={
+                "pm5_log_date": date,
+                "pm5_log_time": time,
+                "pm5_end_minute": end,
+                "summary_source": "memory",
+                "workout_type": stored.workout_type,
+                "pm5_memory_address": stored.record_address,
+            },
+        )
+        # Keep the memory result out of the live-summary replay cache. A later
+        # 0x39 packet can still supply precise totals and measured averages.
+        self._emit(recovered)
 
     def _general_status(self, values: dict, now: float) -> None:
         state = values["0031_workout_state_raw"]
@@ -419,11 +487,12 @@ class WorkoutRecorder:
                 ]
                 if observed:
                     workout.metadata[field_name] = aggregate(observed)
-        _LOGGER.info(
-            "PM5 recording finalized (%s): %.2f s, %.1f m, %d samples, partial=%s",
-            self._address, workout.elapsed, workout.distance, len(samples),
-            workout.partial or not workout.finished,
-        )
+        if workout.metadata.get("summary_source") != "memory":
+            _LOGGER.info(
+                "PM5 recording finalized (%s): %.2f s, %.1f m, %d samples, partial=%s",
+                self._address, workout.elapsed, workout.distance, len(samples),
+                workout.partial or not workout.finished,
+            )
         self._on_complete(
             {
                 "workout_id": str(uuid4()),

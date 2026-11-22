@@ -74,7 +74,9 @@ If the device is not discovered automatically:
 
 The FIT activity includes rowing time, distance, pace, stroke rate, power, calories, and heart-rate samples when the PM5 reports them. It stores one lap for the full workout. Heart-rate gaps remain empty. Recordings are saved in Home Assistant and survive restarts.
 
-If Home Assistant connects in time to receive only the finish, the workout appears as **Partial recording · PM5 summary only**. Its FIT file includes the final distance and available averages. This recovery depends on receiving a recent finish summary over Bluetooth.
+If Home Assistant receives only the finish, it saves the PM5's final totals and available averages as **Partial recording · PM5 summary only**.
+
+If Home Assistant missed even the finish, leave the PM5 idle when it next connects. The integration checks the latest workout in PM5 Memory and can recover a **Just Row** summary with its logged time, duration, and distance. Reconnect before finishing another workout, since the check reads only the newest entry. A missed row appears in the workout review list as **Recovered from PM5 Memory · Summary only**. If the row already has a recording, the integration keeps its live samples and Garmin review decision.
 
 ### Default Garmin account and phone approval
 
@@ -92,7 +94,7 @@ The integration includes a manual, read-only diagnostic action for administrator
 2. Open **Developer tools → Actions**, select **Concept2 PM5: Read latest stored workout** (`c2_pm5.read_latest_stored_workout`), and choose your monitor.
 3. Run the action. The response includes the record's start address, byte length, and hexadecimal contents. To check the result against the PM5 display, follow the [record comparison guide](tools/README.md).
 
-Reading the record requires an explicit action. Workout history and Garmin uploads continue to use the normal recording and review flow. If you previously installed the standalone development probe, remove its `pm5_memory_probe:` configuration and component directory when you update.
+The diagnostic action returns the raw bytes for inspection. If you previously installed the standalone development probe, remove its `pm5_memory_probe:` configuration and component directory when you update.
 
 ---
 

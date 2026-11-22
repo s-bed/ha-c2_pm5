@@ -1,4 +1,4 @@
-"""Read the latest stored PM5 workout record on explicit request."""
+"""Read the latest stored workout over an idle PM5 connection."""
 
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ _MAX_RECORD_BYTES = 4096
 _BLOCK_BYTES = 64
 
 
+def is_idle(coordinator: PM5Coordinator) -> bool:
+    """Require fresh general status and allow any live recording to finish."""
+    return not coordinator.recorder.recording and coordinator.session._workout_state_raw in (
+        0, 10, 11, 12, 13
+    )
+
+
 async def read_latest(coordinator: PM5Coordinator) -> dict:
     """Return bytes from a single consistent, monitor-supplied descriptor."""
     session = coordinator.session
@@ -30,10 +37,7 @@ async def read_latest(coordinator: PM5Coordinator) -> dict:
             session._client is not client or not client.is_connected
         ):
             raise HomeAssistantError("The PM5 must stay connected during the probe")
-        # A fresh general status packet sets this field on every new connection.
-        if coordinator.recorder.recording or session._workout_state_raw not in (
-            0, 10, 11, 12, 13
-        ):
+        if not is_idle(coordinator):
             raise HomeAssistantError("Wait for idle workout status from the PM5")
 
     async def request(wrapper: int, command: int, length: int, data: bytes = b""):
@@ -77,7 +81,7 @@ async def read_latest(coordinator: PM5Coordinator) -> dict:
         raise
     except TimeoutError as err:
         raise HomeAssistantError("Timed out reading the latest PM5 log record") from err
-    except (BleakError, PM5Unavailable) as err:
+    except (BleakError, OSError, PM5Unavailable) as err:
         raise HomeAssistantError(f"Could not read the PM5 log record: {err}") from err
 
     return {"address": address, "length": length, "record_hex": record.hex()}

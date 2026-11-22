@@ -8,6 +8,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
+from custom_components.c2_pm5.memory_record import decode_stored_workout
+
 _TOOL = Path(__file__).resolve().parents[1] / "tools" / "compare_pm5_record.py"
 _SPEC = importlib.util.spec_from_file_location("compare_pm5_record", _TOOL)
 compare = importlib.util.module_from_spec(_SPEC)
@@ -30,6 +32,26 @@ def response(data):
 
 
 class PM5RecordComparisonTests(TestCase):
+    def test_runtime_accepts_just_row_and_returns_the_physical_record_address(self):
+        raw = example_record()
+        raw[1] = 1
+        raw[29] = 0x81
+        body = response(raw[:82])
+        fields = decode_stored_workout({**body, "address": 0x12000})
+        self.assertEqual(fields.record_address, 0x12000)
+        self.assertEqual(fields.pm_time.isoformat(timespec="minutes"), "2016-05-23T20:18")
+        self.assertEqual((fields.duration_s, fields.distance_m, fields.splits), (1607.3, 5500, 1))
+        for invalid_address in (-1, 2**32 - 81, False, "unknown"):
+            with self.subTest(address=invalid_address), self.assertRaises(ValueError):
+                decode_stored_workout({**body, "address": invalid_address})
+
+    def test_runtime_excludes_usb_only_and_unknown_record_types(self):
+        raw = example_record()
+        for workout_type in (0, 3, 5, 7):
+            raw[1] = workout_type
+            with self.subTest(workout_type=workout_type), self.assertRaises(ValueError):
+                decode_stored_workout(response(raw))
+
     def test_known_headers_and_full_width_duration(self):
         for workout_type in (1, 3, 5):
             with self.subTest(workout_type=workout_type):

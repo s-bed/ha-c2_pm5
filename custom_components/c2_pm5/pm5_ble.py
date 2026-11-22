@@ -251,6 +251,7 @@ class PM5BleSession:
         self._available: bool = False
         self._avail_task: asyncio.Task | None = None
         self._connected: bool = False
+        self.supports_memory_reads = False
         self._reconnect_after: float = 0.0
         self._last_active_monotonic: float | None = None
         self._unsub_adv: CALLBACK_TYPE | None = None
@@ -929,6 +930,7 @@ class PM5BleSession:
                 time.monotonic() - started,
                 "multiplexed" if multiplexed else "direct",
             )
+            self.supports_memory_reads = has_csafe_tx and has_csafe_rx
             self._set_connected(True)
 
             if has_csafe_rx:
@@ -1002,6 +1004,7 @@ class PM5BleSession:
 
         finally:
             _LOGGER.info("PM5 disconnected (%s)", self.address)
+            self.supports_memory_reads = False
             self._set_connected(False)
 
             self._cancel_pending_csafe()

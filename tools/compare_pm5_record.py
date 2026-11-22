@@ -5,43 +5,22 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+from runpy import run_path
 
-_USB_WORKOUT_TYPES = {1: "Just Row", 3: "Fixed distance", 5: "Fixed time"}
+# Load the integration's standalone decoder without importing Home Assistant.
+_DECODER = Path(__file__).resolve().parents[1] / "custom_components/c2_pm5/memory_record.py"
+_decode_stored_workout = run_path(str(_DECODER))["decode_stored_workout"]
 
 
 def decode_candidate(response: dict) -> dict:
     """Apply the three observed RowErg USB layouts to the probe bytes."""
-    if not isinstance(response, dict) or not isinstance(response.get("record_hex"), str):
-        raise ValueError("Expected the probe response object with length and record_hex")
-    record = bytes.fromhex(response["record_hex"])
-    if type(response.get("length")) is not int or response["length"] != len(record):
-        raise ValueError("The reported record length differs from the supplied bytes")
-    if (
-        len(record) < 50
-        or record[0] != 0x95
-        or record[1] not in _USB_WORKOUT_TYPES
-        or record[18:20] != b"\x96\x00"
-    ):
-        raise ValueError("Unrecognized fixed-workout USB header")
-
-    # Cross-check the four-bit count in the header with the actual frames.
-    splits = record[29] & 0x0F
-    if splits == 0 or len(record) != 50 + 32 * splits:
-        raise ValueError("Split count and fixed-size USB layout do not agree")
-    date = int.from_bytes(record[8:10], "big")
-    logged = datetime(
-        2000 + (date >> 9), date & 0x0F, (date >> 4) & 0x1F, record[10], record[11]
-    )
-    duration = int.from_bytes(record[20:24], "big") / 10
-    distance = int.from_bytes(record[24:28], "big")
-    if not duration or not distance:
-        raise ValueError("The candidate record has empty workout totals")
+    row = _decode_stored_workout(response, allow_usb_candidates=True)
     return {
-        "workout_type": _USB_WORKOUT_TYPES[record[1]],
-        "pm_time": logged.isoformat(timespec="minutes"),
-        "duration_s": duration,
-        "distance_m": distance,
-        "splits": splits,
+        "workout_type": row.workout_type,
+        "pm_time": row.pm_time.isoformat(timespec="minutes"),
+        "duration_s": row.duration_s,
+        "distance_m": row.distance_m,
+        "splits": row.splits,
     }
 
 

@@ -5,6 +5,7 @@ from unittest import TestCase
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
+from custom_components.c2_pm5.memory_record import StoredWorkout
 from custom_components.c2_pm5.workout_recorder import WorkoutRecorder
 
 
@@ -57,6 +58,43 @@ class WorkoutRecorderTests(TestCase):
         delay, callback = self.loop.call_later.call_args.args
         self.assertEqual(delay, 4)
         callback()
+
+    def test_memory_respects_pm_local_time_and_rejects_unresolvable_minutes(self):
+        for local in (
+            datetime(2026, 3, 8, 2, 30),  # DST gap.
+            datetime(2026, 11, 1, 1, 30),  # Ambiguous historical hour.
+            datetime(2026, 11, 22, 0, 0),  # Future PM clock.
+        ):
+            with self.subTest(local=local):
+                self.recorder.recover_memory(
+                    StoredWorkout(pm_time=local, duration_s=22.5, distance_m=60,
+                                  workout_type="Just Row", splits=1),
+                    _RECEIVED,
+                )
+                self.assertFalse(self.saved)
+        local = datetime(2026, 11, 20, 0, 1)
+        self.recorder.recover_memory(
+            StoredWorkout(pm_time=local, duration_s=92.5, distance_m=60,
+                          workout_type="Just Row", splits=1),
+            _RECEIVED,
+        )
+        [row] = self.saved
+        self.assertEqual(row["end_time"], local.replace(tzinfo=_ZONE).timestamp())
+        self.assertEqual(row["start_time"], row["end_time"] - 92.5)
+
+    def test_matching_live_finish_waiting_for_extra_metrics_has_priority_over_memory(self):
+        self.recorder.receive(summary(20.54, 100.7), _RECEIVED)
+        self.recorder.recover_memory(
+            StoredWorkout(pm_time=datetime(2026, 11, 21, 19, 27), duration_s=20.5,
+                          distance_m=100, workout_type="Just Row", splits=1),
+            _RECEIVED,
+        )
+        self.assertFalse(self.saved)
+        self.recorder.receive(additional(), _RECEIVED + 1)
+        self.expire_summary_grace()
+        [row] = self.saved
+        self.assertEqual((row["elapsed_seconds"], row["distance_m"]), (20.54, 100.7))
+        self.assertEqual(row["avg_power_w"], 165)
 
     def test_standalone_summary_has_reported_totals_and_zero_live_samples(self):
         self.recorder.receive(summary(), _RECEIVED)

@@ -12,7 +12,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from custom_components.c2_pm5 import PM5Coordinator
+from custom_components.c2_pm5.memory_record import StoredWorkout
 from custom_components.c2_pm5.workout_manager import WorkoutManager
+from custom_components.c2_pm5.workout_recorder import WorkoutRecorder
 
 
 class SummaryStorageTests(IsolatedAsyncioTestCase):
@@ -59,6 +61,145 @@ class SummaryStorageTests(IsolatedAsyncioTestCase):
             "heart_rate_sample_count": 1,
             "samples": [{"timestamp": start + duration, "distance_m": distance, "heart_rate_bpm": 112}],
         }
+
+    def recover_memory(self, duration=120.0, distance=500, address=4096):
+        stored = StoredWorkout(
+            workout_type="Just Row", pm_time=datetime(2026, 11, 21, 19, 27),
+            duration_s=duration, distance_m=distance, splits=1, record_address=address,
+        )
+        recorder = WorkoutRecorder(
+            self.hass.loop, self.address, "RowErg", self.manager.record
+        )
+        recorder.recover_memory(stored, self.now + 7 * 86400)
+
+    async def test_historical_memory_one_week_later_survives_restart_and_replay(self):
+        self.recover_memory()
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        [row] = self.manager.list_workouts()
+        self.assertEqual(row["end_time"], self.now - 54)
+        self.assertEqual(row["start_time"], self.now - 54 - 120)
+        self.assertEqual(row["summary_source"], "memory")
+        self.assertTrue(row["partial"] and row["summary_only"])
+        self.assertEqual((row["sample_count"], row["heart_rate_sample_count"]), (0, 0))
+        fit = await self.manager.async_export(row["workout_id"])
+        messages, errors = Decoder(Stream.from_byte_array(bytearray(fit))).read()
+        self.assertFalse(errors)
+        self.assertEqual(messages["session_mesgs"][0]["total_distance"], 500)
+        self.assertEqual(messages["lap_mesgs"][0]["total_elapsed_time"], 120)
+        await self.manager.async_keep_workout(row["workout_id"])
+        self.manager = WorkoutManager(self.hass)
+        await self.manager.async_initialize()
+        self.signal.reset_mock()
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        [replayed] = self.manager.list_workouts()
+        self.assertEqual(replayed["workout_id"], row["workout_id"])
+        self.assertEqual(replayed["status"], "kept_local")
+        self.signal.assert_not_called()
+
+    async def test_memory_deduplicates_precise_live_finish_and_distinct_memory_locations(self):
+        live = self.summary(120.09, 500.8)
+        self.manager.record(live)
+        self.recover_memory()
+        self.recover_memory(address=4178)
+        await self.hass.async_block_till_done()
+        self.assertEqual(len(self.manager.list_workouts()), 2)
+        row = self.manager.get_summary(live["workout_id"])
+        self.assertEqual(row["pm5_memory_address"], 4096)
+        self.assertEqual((row["elapsed_seconds"], row["distance_m"]), (120.09, 500.8))
+        self.assertEqual(row["avg_heart_rate_bpm"], 120)
+        self.assertEqual(self.signal.call_count, 2)
+
+    async def test_memory_does_not_merge_another_workout_type_at_the_same_minute(self):
+        live = self.summary()
+        live["workout_type"] = "Fixed distance (splits)"
+        self.manager.record(live)
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        self.assertCountEqual(
+            [workout["workout_type"] for workout in self.manager.list_workouts()],
+            ["Fixed distance (splits)", "Just Row"],
+        )
+
+    async def test_memory_before_live_summary_keeps_resolved_track_and_precise_totals(self):
+        capture = self.capture()
+        self.manager.record(capture)
+        await self.hass.async_block_till_done()
+        workout_id = capture["workout_id"]
+        await self.manager.async_keep_workout(workout_id)
+        self.signal.reset_mock()
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        [partial] = self.manager.list_workouts()
+        self.assertEqual((partial["workout_id"], partial["distance_m"]), (workout_id, 500))
+        self.manager = WorkoutManager(self.hass)
+        await self.manager.async_initialize()
+        # A live 0x39 is more precise than memory and also carries HR.
+        self.manager.record(self.summary(120.06, 500.4))
+        await self.hass.async_block_till_done()
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        [row] = self.manager.list_workouts()
+        self.assertEqual((row["workout_id"], row["status"]), (workout_id, "kept_local"))
+        self.assertFalse(row["summary_only"])
+        self.assertEqual((row["elapsed_seconds"], row["distance_m"]), (120.06, 500.4))
+        self.assertEqual(row["avg_heart_rate_bpm"], 120)
+        self.assertEqual((await self.manager.async_get_workout(workout_id))["samples"], capture["samples"])
+        self.signal.assert_not_called()
+
+    async def test_memory_after_live_without_log_minute_keeps_precise_track(self):
+        capture = self.capture(120.06, 500.4)
+        capture.update(partial=False, workout_type="JustRow (splits)")
+        self.manager.record(capture)
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        [row] = self.manager.list_workouts()
+        self.assertEqual(row["workout_id"], capture["workout_id"])
+        self.assertFalse(row["partial"] or row["summary_only"])
+        self.assertEqual(row["workout_type"], capture["workout_type"])
+        self.assertEqual((row["elapsed_seconds"], row["distance_m"]), (120.06, 500.4))
+        self.assertEqual((await self.manager.async_get_workout(row["workout_id"]))["samples"], capture["samples"])
+        self.signal.assert_called_once()
+
+    async def test_shorter_ble_replay_preserves_existing_samples_on_memory_recovered_row(self):
+        capture = self.capture()
+        capture["samples"].insert(0, {"timestamp": capture["start_time"] + 1, "distance_m": 2})
+        capture["sample_count"] = 2
+        self.manager.record(capture)
+        self.recover_memory()
+        await self.hass.async_block_till_done()
+        self.signal.reset_mock()
+        live = self.summary(120.08, 500.6)
+        live.update(
+            summary_only=False, samples=[{"timestamp": self.now, "distance_m": 500.6}],
+            sample_count=1, heart_rate_sample_count=0,
+        )
+        self.manager.record(live)
+        await self.hass.async_block_till_done()
+        [row] = self.manager.list_workouts()
+        self.assertEqual((row["elapsed_seconds"], row["distance_m"]), (120.08, 500.6))
+        self.assertEqual(row["avg_heart_rate_bpm"], 120)
+        self.assertEqual((row["sample_count"], row["heart_rate_sample_count"]), (2, 1))
+        workout = await self.manager.async_get_workout(capture["workout_id"])
+        self.assertEqual(workout["samples"], capture["samples"])
+        self.signal.assert_not_called()
+
+    async def test_repeated_memory_read_retries_failed_write(self):
+        with patch.object(self.manager, "_write_recording", side_effect=OSError("disk full")):
+            with self.assertLogs("custom_components.c2_pm5.workout_manager", level="ERROR"):
+                self.recover_memory()
+                await self.hass.async_block_till_done()
+        self.assertFalse(self.manager.list_workouts())
+        with self.assertLogs("custom_components.c2_pm5.workout_manager", level="INFO") as log:
+            self.recover_memory()
+            await self.hass.async_block_till_done()
+            self.recover_memory()
+            await self.hass.async_block_till_done()
+        self.assertEqual(len(log.records), 1)
+        self.assertIn("Recovered workout from PM5 memory", log.output[0])
+        self.assertEqual(len(self.manager.list_workouts()), 1)
+        self.signal.assert_called_once()
 
     async def test_direct_and_multiplexed_packets_through_coordinator(self):
         coordinator = PM5Coordinator(
