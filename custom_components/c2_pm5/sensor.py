@@ -35,6 +35,32 @@ from . import PM5Coordinator
 from .pm5_ble import PM5Data
 
 
+# Keep metrics represented in saved workout samples or summaries enabled.
+# 0x0035 exposes the stroke count that the recorder takes from 0x0036.
+_WORKOUT_SENSOR_KEYS = frozenset(
+    {
+        "0031_elapsed_time_s",
+        "0031_distance_m",
+        "0031_workout_type",
+        "0032_speed_m_s",
+        "0032_stroke_rate_spm",
+        "0032_heart_rate_bpm",
+        "0032_current_pace_s_per_500m",
+        "0033_average_power_w",
+        "0033_total_calories",
+        "0035_stroke_count",
+        "0036_stroke_power_w",
+        "0039_elapsed_time_s",
+        "0039_distance_m",
+        "0039_avg_stroke_rate_spm",
+        "0039_workout_type",
+        "0039_avg_pace_s_per_500m",
+        "003a_total_calories",
+        "003a_avg_power_w",
+    }
+)
+
+
 @dataclass(frozen=True, kw_only=True)
 class PM5SensorDescription(SensorEntityDescription):
     key: str
@@ -670,6 +696,7 @@ class PM5Sensor(RestoreSensor):
         self.entity_description = description
         self._attr_name = f"{coordinator.device_type} {description.name}"
         self._attr_unique_id = f"{coordinator.address}_{description.key}"
+        self._attr_entity_registry_enabled_default = description.key in _WORKOUT_SENSOR_KEYS
 
     @property
     def available(self) -> bool:

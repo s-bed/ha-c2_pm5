@@ -839,12 +839,16 @@ class PM5BleSession:
                     continue
 
                 idle_minutes = self.idle_disconnect_minutes
-                if time.monotonic() - last_active < idle_minutes * 60:
+                idle_seconds = time.monotonic() - last_active
+                if idle_seconds < idle_minutes * 60:
                     continue
 
                 _LOGGER.warning(
-                    "PM5 idle for %d minutes; disconnecting to allow sleep (%s)",
+                    "PM5 idle for %.0f seconds (timeout %d minutes, workout state %s); "
+                    "disconnecting to allow sleep (%s)",
+                    idle_seconds,
                     idle_minutes,
+                    self._workout_state_raw,
                     self.address,
                 )
                 idle_event.set()
@@ -1015,7 +1019,16 @@ class PM5BleSession:
                 )
 
         finally:
-            _LOGGER.info("PM5 disconnected (%s)", self.address)
+            if self._stop.is_set():
+                reason = "integration stop"
+            elif idle_disconnect.is_set():
+                reason = "idle timeout"
+            elif disconnected.is_set():
+                reason = "remote disconnect"
+            else:
+                reason = "connection cleanup"
+            teardown_started = time.monotonic()
+            _LOGGER.debug("Starting PM5 BLE teardown (%s): %s", self.address, reason)
             self.supports_memory_reads = False
             self._set_connected(False)
 
@@ -1026,12 +1039,32 @@ class PM5BleSession:
             for uuid in subscriptions:
                 try:
                     await client.stop_notify(uuid)
-                except Exception:
-                    pass
+                except Exception as err:
+                    _LOGGER.debug(
+                        "Could not stop PM5 notifications for %s (%s): %s",
+                        uuid,
+                        self.address,
+                        err,
+                    )
             try:
                 await client.disconnect()
-            except Exception:
-                pass
+            except Exception as err:
+                _LOGGER.warning(
+                    "PM5 BLE disconnect failed (%s) after %.1fs (%s): %s",
+                    self.address, time.monotonic() - teardown_started, reason, err,
+                )
+            else:
+                elapsed = time.monotonic() - teardown_started
+                if client.is_connected:
+                    _LOGGER.warning(
+                        "PM5 still reports connected after BLE teardown (%s) in %.1fs (%s)",
+                        self.address, elapsed, reason,
+                    )
+                else:
+                    _LOGGER.info(
+                        "PM5 BLE teardown complete (%s) in %.1fs (%s)",
+                        self.address, elapsed, reason,
+                    )
 
     # ---------- Notification Parsers ----------
     def _handle_csafe_tx(self, _uuid: str, data: bytearray) -> None:

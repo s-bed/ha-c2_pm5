@@ -149,3 +149,75 @@ class PM5ConnectionTests(IsolatedAsyncioTestCase):
         self.session._client = Mock()
         forward(None, packet)
         handler.assert_called_once_with("test", packet)
+
+    def mock_connection(self):
+        """Provide a subscribed client whose disconnect the test can control."""
+        client = SimpleNamespace(
+            is_connected=True,
+            services=SimpleNamespace(get_characteristic=Mock(return_value=None)),
+            start_notify=AsyncMock(),
+            stop_notify=AsyncMock(),
+            disconnect=AsyncMock(),
+        )
+
+        async def time_out(idle_event):
+            idle_event.set()
+
+        self.enterContext(patch.object(self.session, "_get_ble_device"))
+        self.enterContext(patch.object(self.session, "_idle_watchdog", side_effect=time_out))
+        self.enterContext(patch.object(pm5_ble, "establish_connection", return_value=client))
+        return client
+
+    async def test_idle_teardown_is_logged_as_complete_after_client_disconnects(self):
+        client = self.mock_connection()
+        disconnect_started, release_disconnect = asyncio.Event(), asyncio.Event()
+
+        async def disconnect():
+            disconnect_started.set()
+            await release_disconnect.wait()
+            client.is_connected = False
+
+        client.disconnect.side_effect = disconnect
+        with self.assertLogs(pm5_ble.__name__, "DEBUG") as log:
+            listener = asyncio.create_task(self.session._connect_and_listen())
+            try:
+                async with asyncio.timeout(1):
+                    await disconnect_started.wait()
+                self.assertTrue(any(
+                    "Starting PM5 BLE teardown" in message and "idle timeout" in message
+                    for message in log.output
+                ))
+                self.assertFalse(any("PM5 BLE teardown complete" in message for message in log.output))
+            finally:
+                release_disconnect.set()
+                await listener
+        self.assertTrue(any("PM5 BLE teardown complete" in message for message in log.output))
+        self.assertFalse(self.session.is_connected)
+
+    async def test_disconnect_error_is_logged_without_a_success_message(self):
+        client = self.mock_connection()
+        client.disconnect.side_effect = pm5_ble.BleakError("proxy refused disconnect")
+
+        with self.assertLogs(pm5_ble.__name__, "DEBUG") as log:
+            await self.session._connect_and_listen()
+
+        self.assertTrue(any(
+            record.levelname == "WARNING" and "proxy refused disconnect" in record.getMessage()
+            for record in log.records
+        ))
+        self.assertFalse(any("PM5 BLE teardown complete" in message for message in log.output))
+        self.assertFalse(self.session.is_connected)
+
+    async def test_disconnect_returning_with_connected_client_warns(self):
+        client = self.mock_connection()
+
+        with self.assertLogs(pm5_ble.__name__, "DEBUG") as log:
+            await self.session._connect_and_listen()
+
+        client.disconnect.assert_awaited_once()
+        self.assertTrue(any(
+            record.levelname == "WARNING" and "still" in record.getMessage().lower()
+            and "connected" in record.getMessage().lower()
+            for record in log.records
+        ))
+        self.assertFalse(any("PM5 BLE teardown complete" in message for message in log.output))

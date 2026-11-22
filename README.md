@@ -74,6 +74,8 @@ If the device is not discovered automatically:
 
 The FIT activity includes rowing time, distance, pace, stroke rate, power, calories, and heart-rate samples when the PM5 reports them. It stores one lap for the full workout. Heart-rate gaps remain empty. Recordings are saved in Home Assistant and survive restarts.
 
+For newly registered entities, Home Assistant enables sensors for saved workout metrics by default. You can enable additional sensors such as battery level, drag factor, and interval diagnostics from the PM5 device page. Workout recording uses Bluetooth data directly and works with any sensor selection.
+
 If Home Assistant receives only the finish, it saves the PM5's final totals and available averages as **Partial recording · PM5 summary only**.
 
 If Home Assistant missed even the finish, leave the PM5 idle when it next connects. The integration checks the latest workout in PM5 Memory and can recover a **Just Row** summary with its logged time, duration, and distance. Reconnect before finishing another workout, since the check reads only the newest entry. A missed row appears in the workout review list as **Recovered from PM5 Memory · Summary only**. If the row already has a recording, the integration keeps its live samples and Garmin review decision.
